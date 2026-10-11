@@ -1,0 +1,4 @@
+# never commit game binaries
+*.dll
+*.exe
+*.u
