@@ -1,0 +1,3350 @@
+From cf46a626390ee9555355aeb543610cdea2278bd7 Mon Sep 17 00:00:00 2001
+From: olivergrosche <15156206+olivergrosche@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 21:40:48 +0200
+Subject: [PATCH] Launcher: fix minute-long level loads under Wine on Android
+ storage
+
+Under Wine (e.g. GameHub or Winlator with FEX) on Android's case-sensitive
+FUSE storage, every lookup of a file that does not exist makes Wine scan the
+whole directory for a case-insensitive match - about 2-15 ms each on a
+Snapdragon tablet, depending on the directory. A savegame load made about
+15,000 of them:
+
+- Localize() looks for <package>.int for every translatable property of
+  every object it loads (FConfigCacheIni::Find probes with
+  GFileManager->FileSize and never remembers a missing file), mostly for
+  the map's own .int, which doesn't exist.
+- Core tries to load a native DLL for every package it binds:
+  <System>\<package>, <System>\<package>.dll and the never valid
+  _<System>\<package>.dll.
+- appFindPackageFile searches each package in every search path.
+- D3D10Drv looks for a replacement .dds under ..\textures for every texture
+  it uploads, and for some also .detail.dds and .dds.flags.
+
+PathCache lists each directory below the game directory once and answers
+those lookups from the listing; the save and cache directories are never
+cached. FileHooks patches the import tables of all loaded modules for the
+Win32 file calls: read-only opens and attribute queries of files known to be
+missing fail at once with the error the OS would report, and so do Core.dll's
+LoadLibraryW calls for package DLLs the listing rules out (and for the never
+valid name). Every create, write, move or delete invalidates the affected
+directory, and each map load starts with fresh listings. FileSize() is
+answered from the listing, and packages are opened by their on-disk spelling.
+
+FastFileReader maps package files into memory (512 MB budget, buffered
+fallback) instead of the engine's 1 KB reads with a seek per object.
+
+Diagnostics, off by default: [DeusExe] FileTrace=True logs counts, times and
+callers of the file calls per level change, LoadProfiler=True samples the
+main thread during map loads. CLevelWatch now also reports a load that
+reuses the old level's address or fails. On a crash the hooks pass calls
+through.
+
+Measured on the tablet (Proton 11 arm64x + FEX, DXVK): main menu
+45.6 s -> 3.1 s (D3D10Drv), savegame load 4-5 min -> 1.1 s (DECoR).
+[DeusExe] PathCache=False turns the cache and the hooks off, and
+FastFileReader=False uses the engine's reader again.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ launcher/src/FastFileReader.cpp      |  359 +++++++
+ launcher/src/FastFileReader.h        |   27 +
+ launcher/src/FileHooks.cpp           | 1390 ++++++++++++++++++++++++++
+ launcher/src/FileHooks.h             |   30 +
+ launcher/src/FileManagerDeusExe.cpp  |   32 +-
+ launcher/src/FileManagerDeusExe.h    |    8 +
+ launcher/src/Launcher.cpp            |   13 +-
+ launcher/src/LevelWatch.cpp          |   19 +-
+ launcher/src/LevelWatch.h            |    8 +
+ launcher/src/LoadProfiler.cpp        |  454 +++++++++
+ launcher/src/LoadProfiler.h          |   26 +
+ launcher/src/OutputDeviceFileFlush.h |   15 +
+ launcher/src/PathCache.cpp           |  448 +++++++++
+ launcher/src/PathCache.h             |   56 ++
+ launcher/src/Symbols.cpp             |  120 +++
+ launcher/src/Symbols.h               |   26 +
+ launcher/src/launcher.vcxproj        |   10 +
+ 17 files changed, 3035 insertions(+), 6 deletions(-)
+ create mode 100644 launcher/src/FastFileReader.cpp
+ create mode 100644 launcher/src/FastFileReader.h
+ create mode 100644 launcher/src/FileHooks.cpp
+ create mode 100644 launcher/src/FileHooks.h
+ create mode 100644 launcher/src/LoadProfiler.cpp
+ create mode 100644 launcher/src/LoadProfiler.h
+ create mode 100644 launcher/src/PathCache.cpp
+ create mode 100644 launcher/src/PathCache.h
+ create mode 100644 launcher/src/Symbols.cpp
+ create mode 100644 launcher/src/Symbols.h
+
+diff --git a/launcher/src/FastFileReader.cpp b/launcher/src/FastFileReader.cpp
+new file mode 100644
+index 0000000..a88a90b
+--- /dev/null
++++ b/launcher/src/FastFileReader.cpp
+@@ -0,0 +1,359 @@
++#include "stdafx.h"
++#include "FastFileReader.h"
++#include "PathCache.h"
++
++// See FastFileReader.h. Measured on the PC for the main menu map (DX.dx):
++// the engine's reader issues ~60,000 ReadFile and ~83,000 SetFilePointer
++// calls (68 MB).
++//
++// Strategy per opened package:
++// 1. Map the whole file read-only (CreateFileMapping/MapViewOfFile). Every
++//    Seek/Serialize is then a memcpy - no syscalls at all; page faults are
++//    served by the host kernel. Capped by a global address-space budget: the
++//    process is 32-bit, and DXVK and HD texture packs need address space too.
++// 2. If mapping fails or the budget is used up: a buffered reader that reads
++//    what the engine announces via Precache() (the export's serial size),
++//    at least BlockSize, and serves seeks inside the buffer from memory.
++//
++// [DeusExe] FastFileReader=False uses the engine's own reader instead.
++namespace
++{
++    constexpr INT BlockSize = 32 * 1024;          // minimum refill of the buffered reader
++    constexpr INT MaxBufferSize = 1024 * 1024;    // largest refill (big Precache hints)
++    constexpr LONGLONG MapBudget = 512LL * 1024 * 1024;
++
++    bool s_bEnabled = true;
++    volatile LONG s_lReads = 0;
++    volatile LONG s_lSeeks = 0;
++    volatile LONG s_lKBytes = 0;
++    volatile LONG s_lMaps = 0;
++    volatile LONG s_lMapKBytes = 0;
++    volatile LONGLONG s_llMapped = 0;              // bytes currently mapped
++
++    void LogReadError(FOutputDevice* pError, const wchar_t* pszWhat, INT iA, INT iB)
++    {
++        pError->Logf(L"%s (%i/%i): %s", pszWhat, iA, iB, appGetSystemErrorMessage());
++    }
++
++    // ------------------------------------------------------------------
++    // Memory-mapped reader
++    // ------------------------------------------------------------------
++    class FArchiveMappedFileReader : public FArchive
++    {
++    public:
++        FArchiveMappedFileReader(HANDLE hFile, HANDLE hMapping, const BYTE* pView, INT iSize, FOutputDevice* pError)
++            : m_hFile(hFile), m_hMapping(hMapping), m_pView(pView), m_iSize(iSize), m_iPos(0), m_pError(pError)
++        {
++            ArIsLoading = ArIsPersistent = 1;
++        }
++
++        ~FArchiveMappedFileReader()
++        {
++            Close();
++        }
++
++        void Seek(INT iPos) override
++        {
++            check(iPos >= 0);
++            check(iPos <= m_iSize);
++            m_iPos = iPos;
++        }
++
++        INT Tell() override { return m_iPos; }
++        INT TotalSize() override { return m_iSize; }
++        void Precache(INT /*HintCount*/) override {}
++
++        UBOOL Close() override
++        {
++            if (m_pView)
++            {
++                UnmapViewOfFile(m_pView);
++                InterlockedExchangeAdd64(&s_llMapped, -static_cast<LONGLONG>(m_iSize));
++                m_pView = nullptr;
++            }
++            if (m_hMapping)
++            {
++                CloseHandle(m_hMapping);
++                m_hMapping = nullptr;
++            }
++            if (m_hFile)
++            {
++                CloseHandle(m_hFile);
++                m_hFile = nullptr;
++            }
++            return !ArIsError;
++        }
++
++        void Serialize(void* pData, INT iLength) override
++        {
++            if (iLength <= 0)
++            {
++                return;
++            }
++            if (!m_pView || iLength > m_iSize - m_iPos)
++            {
++                ArIsError = 1;
++                if (m_pError)
++                {
++                    m_pError->Logf(L"ReadFile beyond EOF %i+%i/%i", m_iPos, iLength, m_iSize);
++                }
++                return;
++            }
++            appMemcpy(pData, m_pView + m_iPos, iLength);
++            m_iPos += iLength;
++        }
++
++    private:
++        HANDLE m_hFile;
++        HANDLE m_hMapping;
++        const BYTE* m_pView;
++        INT m_iSize;
++        INT m_iPos;
++        FOutputDevice* m_pError;
++    };
++
++    // ------------------------------------------------------------------
++    // Buffered reader (fallback when a file can't be mapped)
++    // ------------------------------------------------------------------
++    class FArchiveBufferedFileReader : public FArchive
++    {
++    public:
++        FArchiveBufferedFileReader(HANDLE hFile, FOutputDevice* pError, INT iSize)
++            : m_hFile(hFile), m_pError(pError), m_iSize(iSize),
++              m_iPos(0), m_iOsPos(0), m_iBufferBase(0), m_iBufferCount(0), m_iHint(0),
++              m_iCapacity(Min(BlockSize, Max(iSize, 1))),
++              m_pBuffer(static_cast<BYTE*>(appMalloc(m_iCapacity, L"FastFileReader")))
++        {
++            ArIsLoading = ArIsPersistent = 1;
++        }
++
++        ~FArchiveBufferedFileReader()
++        {
++            if (m_hFile)
++            {
++                Close();
++            }
++            appFree(m_pBuffer);
++        }
++
++        void Seek(INT iPos) override
++        {
++            check(iPos >= 0);
++            check(iPos <= m_iSize);
++            // No OS call: the file pointer moves lazily in OsRead and a target
++            // inside the buffer is served from memory.
++            m_iPos = iPos;
++            m_iHint = 0;
++        }
++
++        INT Tell() override { return m_iPos; }
++        INT TotalSize() override { return m_iSize; }
++
++        void Precache(INT iHintCount) override
++        {
++            // ULinkerLoad calls Seek(SerialOffset) + Precache(SerialSize)
++            // before deserializing an export: read that much in one go.
++            m_iHint = Max(iHintCount, 0);
++        }
++
++        UBOOL Close() override
++        {
++            if (m_hFile)
++            {
++                CloseHandle(m_hFile);
++            }
++            m_hFile = nullptr;
++            return !ArIsError;
++        }
++
++        void Serialize(void* pData, INT iLength) override
++        {
++            BYTE* pOut = static_cast<BYTE*>(pData);
++            while (iLength > 0)
++            {
++                if (m_iPos < m_iBufferBase || m_iPos >= m_iBufferBase + m_iBufferCount)
++                {
++                    if (iLength >= MaxBufferSize)
++                    {
++                        // Huge read: straight into the caller's memory.
++                        if (!OsRead(m_iPos, pOut, iLength))
++                        {
++                            return;
++                        }
++                        m_iPos += iLength;
++                        return;
++                    }
++                    if (!Refill(iLength))
++                    {
++                        return;
++                    }
++                }
++                const INT iCopy = Min(iLength, m_iBufferBase + m_iBufferCount - m_iPos);
++                appMemcpy(pOut, m_pBuffer + (m_iPos - m_iBufferBase), iCopy);
++                m_iPos += iCopy;
++                iLength -= iCopy;
++                pOut += iCopy;
++            }
++        }
++
++    private:
++        bool Refill(INT iLength)
++        {
++            const INT iWant = Min(Max(Max(m_iHint, iLength), BlockSize), MaxBufferSize);
++            m_iHint = 0;
++            if (iWant > m_iCapacity)
++            {
++                BYTE* const pNew = static_cast<BYTE*>(appMalloc(iWant, L"FastFileReader"));
++                appFree(m_pBuffer);
++                m_pBuffer = pNew;
++                m_iCapacity = iWant;
++                m_iBufferCount = 0;
++            }
++            const INT iCount = Min(iWant, m_iSize - m_iPos);
++            if (iCount <= 0)
++            {
++                ArIsError = 1;
++                m_pError->Logf(L"ReadFile beyond EOF %i+%i/%i", m_iPos, iLength, m_iSize);
++                return false;
++            }
++            m_iBufferBase = m_iPos;
++            m_iBufferCount = 0;
++            if (!OsRead(m_iPos, m_pBuffer, iCount))
++            {
++                return false;
++            }
++            m_iBufferCount = iCount;
++            return true;
++        }
++
++        bool MoveOsPointer(INT iAt)
++        {
++            if (m_iOsPos == iAt)
++            {
++                return true;
++            }
++            InterlockedIncrement(&s_lSeeks);
++            if (SetFilePointer(m_hFile, iAt, nullptr, FILE_BEGIN) == INVALID_SET_FILE_POINTER)
++            {
++                ArIsError = 1;
++                LogReadError(m_pError, L"SetFilePointer failed", iAt, m_iSize);
++                m_iOsPos = -1;
++                return false;
++            }
++            m_iOsPos = iAt;
++            return true;
++        }
++
++        bool OsRead(INT iAt, void* pDest, INT iCount)
++        {
++            if (!MoveOsPointer(iAt))
++            {
++                return false;
++            }
++            DWORD dwRead = 0;
++            InterlockedIncrement(&s_lReads);
++            const BOOL bOk = ReadFile(m_hFile, pDest, iCount, &dwRead, nullptr);
++            InterlockedExchangeAdd(&s_lKBytes, static_cast<LONG>(dwRead / 1024));
++            m_iOsPos = bOk ? m_iOsPos + static_cast<INT>(dwRead) : -1;
++            if (!bOk || static_cast<INT>(dwRead) != iCount)
++            {
++                ArIsError = 1;
++                LogReadError(m_pError, L"ReadFile failed", static_cast<INT>(dwRead), iCount);
++                return false;
++            }
++            return true;
++        }
++
++        HANDLE m_hFile;
++        FOutputDevice* m_pError;
++        INT m_iSize;
++        INT m_iPos;          // logical position
++        INT m_iOsPos;        // OS file pointer (-1 = unknown)
++        INT m_iBufferBase;   // file offset of m_pBuffer[0]
++        INT m_iBufferCount;  // valid bytes in m_pBuffer
++        INT m_iHint;         // pending Precache size
++        INT m_iCapacity;     // size of m_pBuffer
++        BYTE* m_pBuffer;
++    };
++
++    FArchive* TryMap(HANDLE hFile, INT iSize, FOutputDevice* pError)
++    {
++        if (iSize <= 0)
++        {
++            return nullptr;  // CreateFileMapping rejects empty files
++        }
++        if (InterlockedExchangeAdd64(&s_llMapped, iSize) + iSize > MapBudget)
++        {
++            InterlockedExchangeAdd64(&s_llMapped, -static_cast<LONGLONG>(iSize));
++            return nullptr;
++        }
++        const HANDLE hMapping = CreateFileMappingW(hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
++        const void* const pView = hMapping ? MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0) : nullptr;
++        if (!pView)
++        {
++            if (hMapping)
++            {
++                CloseHandle(hMapping);
++            }
++            InterlockedExchangeAdd64(&s_llMapped, -static_cast<LONGLONG>(iSize));
++            return nullptr;
++        }
++        InterlockedIncrement(&s_lMaps);
++        InterlockedExchangeAdd(&s_lMapKBytes, iSize / 1024);
++#pragma warning(suppress: 4291)
++        return new(L"FastFileReader") FArchiveMappedFileReader(hFile, hMapping, static_cast<const BYTE*>(pView), iSize, pError);
++    }
++}
++
++FArchive* FastFileReader::Create(const wchar_t* Filename, DWORD Flags, FOutputDevice* Error)
++{
++    //Open by the name as spelled on disk where known: under Wine on a
++    //case-sensitive file system a differently cased name costs a directory
++    //scan ("..\Maps\entry.dx" for Entry.dx).
++    wchar_t szActual[MAX_PATH];
++    const HANDLE hFile = CreateFileW(PathCache::Lookup(Filename, szActual).Kind == PathCache::EKind::File ? szActual : Filename,
++        GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
++    if (hFile == INVALID_HANDLE_VALUE)
++    {
++        if (Flags & FILEREAD_NoFail)
++        {
++            appErrorf(L"Failed to read file: %s", Filename);
++        }
++        return nullptr;
++    }
++    const INT iSize = static_cast<INT>(GetFileSize(hFile, nullptr));
++    // Same tagged allocations as the engine's own reader (freed with delete by ULinkerLoad).
++    if (!s_bEnabled)
++    {
++#pragma warning(suppress: 4291)
++        return new(L"WindowsFileReader") FArchiveFileReader(hFile, Error, iSize);
++    }
++    if (FArchive* const pMapped = TryMap(hFile, iSize, Error))
++    {
++        return pMapped;
++    }
++#pragma warning(suppress: 4291)
++    return new(L"FastFileReader") FArchiveBufferedFileReader(hFile, Error, iSize);
++}
++
++bool FastFileReader::Enabled()
++{
++    return s_bEnabled;
++}
++
++void FastFileReader::ReadConfig()
++{
++    UBOOL bEnabled = TRUE;
++    GConfig->GetBool(PROJECTNAME, L"FastFileReader", bEnabled);
++    s_bEnabled = bEnabled != FALSE;
++    GLog->Logf(L"File reader: %s.", s_bEnabled ? L"memory-mapped (buffered fallback)" : L"the engine's own (not counted below)");
++}
++
++void FastFileReader::TakeStats(INT& Reads, INT& Seeks, INT& KBytes, INT& Maps, INT& MapKBytes)
++{
++    Reads = InterlockedExchange(&s_lReads, 0);
++    Seeks = InterlockedExchange(&s_lSeeks, 0);
++    KBytes = InterlockedExchange(&s_lKBytes, 0);
++    Maps = InterlockedExchange(&s_lMaps, 0);
++    MapKBytes = InterlockedExchange(&s_lMapKBytes, 0);
++}
+diff --git a/launcher/src/FastFileReader.h b/launcher/src/FastFileReader.h
+new file mode 100644
+index 0000000..8b5c85c
+--- /dev/null
++++ b/launcher/src/FastFileReader.h
+@@ -0,0 +1,27 @@
++#pragma once
++
++// Package reader replacing the engine's FArchiveFileReader.
++//
++// The stock reader (Core/Inc/FFileManagerWindows.h) has a 1 KB buffer and
++// every Seek() calls SetFilePointer and drops the buffer, even when the
++// target is already buffered. Loading a level preloads every export, i.e.
++// a Seek plus one or more <=1 KB ReadFile calls per object - tens of
++// thousands of syscalls per map, each a round trip through Wine and FEX on
++// Android. (The minute-long loads there were failed file lookups, though,
++// not reads - see PathCache.h.)
++//
++// This reader maps the file into memory where it can, and otherwise keeps a
++// large buffer, serves seeks inside it without touching the OS, and only
++// moves the file pointer right before a real read.
++namespace FastFileReader
++{
++    // Same contract as FFileManagerWindows::CreateFileReader.
++    FArchive* Create(const wchar_t* Filename, DWORD Flags, FOutputDevice* Error);
++
++    // Enabled by default; [DeusExe] FastFileReader=False uses the engine's own reader.
++    bool Enabled();
++    void ReadConfig();
++
++    // Totals since the previous call: OS reads, OS seeks, KB read; files mapped, KB mapped.
++    void TakeStats(INT& Reads, INT& Seeks, INT& KBytes, INT& Maps, INT& MapKBytes);
++}
+diff --git a/launcher/src/FileHooks.cpp b/launcher/src/FileHooks.cpp
+new file mode 100644
+index 0000000..6e8a096
+--- /dev/null
++++ b/launcher/src/FileHooks.cpp
+@@ -0,0 +1,1390 @@
++#include "stdafx.h"
++#include "FileHooks.h"
++#include "PathCache.h"
++#include "Symbols.h"
++
++#include <intrin.h>
++#include <psapi.h>
++#pragma comment(lib, "psapi.lib")
++
++#pragma intrinsic(_ReturnAddress, _AddressOfReturnAddress)
++
++namespace
++{
++    enum EApi
++    {
++        Api_CreateFileW,
++        Api_CreateFileA,
++        Api_GetFileAttributesW,
++        Api_GetFileAttributesA,
++        Api_GetFileAttributesExW,
++        Api_GetFileAttributesExA,
++        Api_FindFirstFileW,
++        Api_FindFirstFileA,
++        Api_FindFirstFileExW,
++        Api_FindFirstFileExA,
++        Api_CopyFileW,
++        Api_CopyFileA,
++        Api_CopyFileExW,
++        Api_CopyFileExA,
++        Api_MoveFileW,
++        Api_MoveFileA,
++        Api_MoveFileExW,
++        Api_MoveFileExA,
++        Api_DeleteFileW,
++        Api_DeleteFileA,
++        Api_CreateDirectoryW,
++        Api_CreateDirectoryA,
++        Api_RemoveDirectoryW,
++        Api_RemoveDirectoryA,
++        Api_LoadLibraryW,
++        Api_LoadLibraryA,
++        Api_LoadLibraryExW,
++        Api_LoadLibraryExA,
++        Api_Count
++    };
++
++    struct FTarget
++    {
++        const char* pszName;
++        void* pfnHook;
++        void* pfnOriginal;  //What the hook calls: what imports from kernel32 resolve to
++        void* pfnAlt;       //The kernelbase export, for imports through kernelbase or API sets
++    };
++
++    FTarget s_aTargets[Api_Count]; //Filled by Install()
++
++    // ---- trace data: fixed tables, written from any thread under s_TraceLock ----
++
++    constexpr int MaxFrames = 6;        //Direct caller, then the next return addresses found on the stack
++    constexpr int MaxCallers = 2048;
++    constexpr int MaxFiles = 8192;
++    constexpr int NameChars = 120;
++
++    struct FApiStat
++    {
++        LONG lCount;
++        LONG lFailed;
++        LONG lCached;                   //Answered from the path cache
++        LONGLONG llTicks;
++    };
++
++    struct FCallerStat
++    {
++        bool bUsed;
++        WORD wApi;
++        DWORD dwHash;
++        DWORD aFrames[MaxFrames];
++        LONG lCount;
++        LONG lFailed;
++        LONG lCached;
++        LONGLONG llTicks;
++        wchar_t szExample[NameChars];
++    };
++
++    struct FFileStat
++    {
++        bool bUsed;
++        WORD wApi;
++        DWORD dwHash;
++        LONG lCount;
++        LONG lFailed;
++        LONG lCached;
++        LONGLONG llTicks;
++        wchar_t szName[NameChars];
++    };
++
++    struct FTrace
++    {
++        FApiStat aApis[Api_Count];
++        FCallerStat aCallers[MaxCallers];
++        FFileStat aFiles[MaxFiles];
++        LONG lDroppedCallers;
++        LONG lDroppedFiles;
++    };
++
++    FTrace* s_pTrace = nullptr; //VirtualAlloc'ed: the engine's allocator isn't thread-safe
++    SRWLOCK s_TraceLock = SRWLOCK_INIT;
++
++    // ---- module ranges, for telling return addresses on the stack ----
++
++    struct FModuleRange
++    {
++        DWORD dwBase;
++        DWORD dwEnd;
++    };
++
++    struct FModuleTable
++    {
++        int iCount;
++        FModuleRange aRanges[512]; //Sorted by base
++    };
++
++    //Replaced, never freed, when the module set changes: hooks on other threads may still read the old one
++    FModuleTable* volatile s_pModules = nullptr;
++
++    volatile bool s_bActive = false;    //False: hooks only pass through
++    volatile bool s_bTrace = false;
++    volatile bool s_bUseCache = false;
++    HMODULE s_hKernel32 = nullptr;
++    HMODULE s_hKernelBase = nullptr;
++    HMODULE s_hNtdll = nullptr;
++    CRITICAL_SECTION s_csPatch;
++    LONG s_lPatchedSlots = 0;
++    LARGE_INTEGER s_liFreq = {};
++
++    // ---- stack scan ----
++
++    bool ReadCodeBytes(const DWORD dwAddr, BYTE(&b)[7])
++    {
++        __try
++        {
++            memcpy(b, reinterpret_cast<const void*>(dwAddr - 7), 7);
++            return true;
++        }
++        __except (EXCEPTION_EXECUTE_HANDLER)
++        {
++            return false;
++        }
++    }
++
++    const FModuleRange* FindModule(const FModuleTable& Table, const DWORD dwAddr)
++    {
++        int iLow = 0;
++        int iHigh = Table.iCount - 1;
++        while (iLow <= iHigh)
++        {
++            const int iMid = (iLow + iHigh) / 2;
++            if (dwAddr < Table.aRanges[iMid].dwBase)
++            {
++                iHigh = iMid - 1;
++            }
++            else if (dwAddr >= Table.aRanges[iMid].dwEnd)
++            {
++                iLow = iMid + 1;
++            }
++            else
++            {
++                return &Table.aRanges[iMid];
++            }
++        }
++        return nullptr;
++    }
++
++    bool InModule(const FModuleTable& Table, const DWORD dwAddr)
++    {
++        return FindModule(Table, dwAddr) != nullptr;
++    }
++
++    //A return address points just past a CALL instruction. The 7 bytes
++    //checked must lie in the same image: a module base on the stack (an
++    //HMODULE) would otherwise fault, and every first-chance fault costs a
++    //signal round trip under Wine and replaces CrashContext's record of the
++    //last real one.
++    bool LooksLikeReturnAddress(const FModuleTable& Table, const DWORD dwAddr)
++    {
++        const FModuleRange* const pRange = FindModule(Table, dwAddr);
++        if (!pRange || dwAddr - pRange->dwBase < 7)
++        {
++            return false;
++        }
++        BYTE b[7];
++        if (!ReadCodeBytes(dwAddr, b))
++        {
++            return false;
++        }
++        return b[2] == 0xE8                                 //call rel32
++            || (b[1] == 0xFF && (b[2] & 0x38) == 0x10)      //call [disp32] / [reg+disp32]
++            || (b[4] == 0xFF && (b[5] & 0x38) == 0x10)      //call [reg+disp8] / [reg+reg]
++            || (b[5] == 0xFF && (b[6] & 0xF8) == 0xD0)      //call reg
++            || (b[5] == 0xFF && (b[6] & 0x38) == 0x10)      //call [reg]
++            || (b[0] == 0xFF && (b[1] & 0x38) == 0x10);     //call [reg*scale+disp32]
++    }
++
++    int ScanStack(const DWORD* const pFrom, DWORD* const pOut, const int iMax)
++    {
++        const FModuleTable* const pTable = s_pModules;
++        if (!pTable)
++        {
++            return 0;
++        }
++        const DWORD* const pTop = static_cast<const DWORD*>(reinterpret_cast<const NT_TIB*>(NtCurrentTeb())->StackBase);
++        const DWORD* const pEnd = std::min(pTop, pFrom + 1024);
++        int n = 0;
++        for (const DWORD* p = pFrom; p < pEnd && n < iMax; ++p)
++        {
++            if (LooksLikeReturnAddress(*pTable, *p))
++            {
++                pOut[n++] = *p;
++            }
++        }
++        return n;
++    }
++
++    // ---- recording ----
++
++    wchar_t FoldCase(const wchar_t c)
++    {
++        return (c >= L'a' && c <= L'z') ? static_cast<wchar_t>(c - (L'a' - L'A')) : c;
++    }
++
++    bool SameName(const wchar_t* a, const wchar_t* b)
++    {
++        for (; *a && FoldCase(*a) == FoldCase(*b); ++a, ++b)
++        {
++        }
++        return FoldCase(*a) == FoldCase(*b);
++    }
++
++    //Keeps the end of long names: the file name is the interesting part.
++    void CopyName(wchar_t(&szDest)[NameChars], const wchar_t* const pszName)
++    {
++        const size_t iLen = wcslen(pszName);
++        if (iLen < NameChars)
++        {
++            wmemcpy(szDest, pszName, iLen + 1);
++            return;
++        }
++        szDest[0] = szDest[1] = szDest[2] = L'.';
++        wmemcpy(szDest + 3, pszName + iLen - (NameChars - 4), NameChars - 4);
++        szDest[NameChars - 1] = L'\0';
++    }
++
++    void Record(const int iApi, const bool bOk, const bool bCached, const LONGLONG llTicks, const wchar_t* const pszName, const DWORD dwCaller, const DWORD* const pStack)
++    {
++        FTrace* const pTrace = s_pTrace;
++        if (!pTrace)
++        {
++            return;
++        }
++
++        DWORD aFrames[MaxFrames] = {};
++        aFrames[0] = dwCaller;
++        ScanStack(pStack, aFrames + 1, MaxFrames - 1);
++        DWORD dwCallerHash = 2166136261u ^ static_cast<DWORD>(iApi); //FNV-1a
++        for (const DWORD dwFrame : aFrames)
++        {
++            dwCallerHash = (dwCallerHash ^ dwFrame) * 16777619u;
++        }
++
++        wchar_t szName[NameChars] = L"";
++        if (pszName)
++        {
++            CopyName(szName, pszName);
++        }
++        DWORD dwNameHash = 2166136261u ^ static_cast<DWORD>(iApi);
++        for (const wchar_t* p = szName; *p; ++p)
++        {
++            dwNameHash = (dwNameHash ^ FoldCase(*p)) * 16777619u;
++        }
++
++        AcquireSRWLockExclusive(&s_TraceLock);
++
++        FApiStat& Api = pTrace->aApis[iApi];
++        ++Api.lCount;
++        Api.lFailed += bOk ? 0 : 1;
++        Api.lCached += bCached ? 1 : 0;
++        Api.llTicks += llTicks;
++
++        FCallerStat* pCaller = nullptr;
++        for (int i = 0; i < MaxCallers; ++i)
++        {
++            FCallerStat& Slot = pTrace->aCallers[(dwCallerHash + i) % MaxCallers];
++            if (!Slot.bUsed)
++            {
++                Slot.bUsed = true;
++                Slot.wApi = static_cast<WORD>(iApi);
++                Slot.dwHash = dwCallerHash;
++                memcpy(Slot.aFrames, aFrames, sizeof(aFrames));
++                wcscpy_s(Slot.szExample, szName);
++                pCaller = &Slot;
++                break;
++            }
++            if (Slot.dwHash == dwCallerHash && Slot.wApi == iApi && memcmp(Slot.aFrames, aFrames, sizeof(aFrames)) == 0)
++            {
++                pCaller = &Slot;
++                break;
++            }
++        }
++        if (pCaller)
++        {
++            ++pCaller->lCount;
++            pCaller->lFailed += bOk ? 0 : 1;
++            pCaller->lCached += bCached ? 1 : 0;
++            pCaller->llTicks += llTicks;
++        }
++        else
++        {
++            ++pTrace->lDroppedCallers;
++        }
++
++        if (szName[0])
++        {
++            FFileStat* pFile = nullptr;
++            for (int i = 0; i < MaxFiles; ++i)
++            {
++                FFileStat& Slot = pTrace->aFiles[(dwNameHash + i) % MaxFiles];
++                if (!Slot.bUsed)
++                {
++                    Slot.bUsed = true;
++                    Slot.wApi = static_cast<WORD>(iApi);
++                    Slot.dwHash = dwNameHash;
++                    wcscpy_s(Slot.szName, szName);
++                    pFile = &Slot;
++                    break;
++                }
++                if (Slot.dwHash == dwNameHash && Slot.wApi == iApi && SameName(Slot.szName, szName))
++                {
++                    pFile = &Slot;
++                    break;
++                }
++            }
++            if (pFile)
++            {
++                ++pFile->lCount;
++                pFile->lFailed += bOk ? 0 : 1;
++                pFile->lCached += bCached ? 1 : 0;
++                pFile->llTicks += llTicks;
++            }
++            else
++            {
++                ++pTrace->lDroppedFiles;
++            }
++        }
++
++        ReleaseSRWLockExclusive(&s_TraceLock);
++    }
++
++    //Timing and caller of one hooked call.
++    class FCall
++    {
++    public:
++        FCall(const int iApi, void* const pReturn, void* const pReturnSlot)
++        :m_iApi(iApi)
++        ,m_dwCaller(reinterpret_cast<DWORD>(pReturn))
++        ,m_pStack(static_cast<const DWORD*>(pReturnSlot) + 1)
++        {
++            QueryPerformanceCounter(&m_liStart);
++        }
++
++        //Leaves GetLastError() as it was.
++        void Done(const bool bOk, const wchar_t* const pszName, const bool bCached = false) const
++        {
++            if (!s_bTrace)
++            {
++                return;
++            }
++            const DWORD dwError = GetLastError();
++            LARGE_INTEGER liEnd;
++            QueryPerformanceCounter(&liEnd);
++            Record(m_iApi, bOk, bCached, liEnd.QuadPart - m_liStart.QuadPart, pszName, m_dwCaller, m_pStack);
++            SetLastError(dwError);
++        }
++
++    private:
++        const int m_iApi;
++        const DWORD m_dwCaller;
++        const DWORD* const m_pStack;
++        LARGE_INTEGER m_liStart;
++    };
++
++    // ---- path cache use ----
++
++    //ANSI path -> wide, the way the A file functions convert; null if it
++    //doesn't fit. Leaves GetLastError() as it was.
++    const wchar_t* Widen(const char* const pszName, wchar_t(&szWide)[MAX_PATH])
++    {
++        if (!pszName)
++        {
++            return nullptr;
++        }
++        const DWORD dwError = GetLastError();
++        const bool bOk = MultiByteToWideChar(AreFileApisANSI() ? CP_ACP : CP_OEMCP, 0, pszName, -1, szWide, MAX_PATH) > 0;
++        SetLastError(dwError);
++        return bOk ? szWide : nullptr;
++    }
++
++    //True, with the error the OS would report, when the cache knows the path doesn't exist.
++    bool KnownMissing(const wchar_t* const pszName, DWORD& dwError)
++    {
++        if (!s_bUseCache || !pszName)
++        {
++            return false;
++        }
++        switch (PathCache::Lookup(pszName).Kind)
++        {
++        case PathCache::EKind::NoFile:
++            dwError = ERROR_FILE_NOT_FOUND;
++            return true;
++        case PathCache::EKind::NoPath:
++            dwError = ERROR_PATH_NOT_FOUND;
++            return true;
++        default:
++            return false;
++        }
++    }
++
++    //Something at pszName (null: unknown) was created, changed or removed. Leaves GetLastError() as it was.
++    void Invalidate(const wchar_t* const pszName)
++    {
++        if (!s_bUseCache)
++        {
++            return;
++        }
++        const DWORD dwError = GetLastError();
++        if (pszName)
++        {
++            PathCache::Invalidate(pszName);
++        }
++        else
++        {
++            PathCache::InvalidateAll();
++        }
++        SetLastError(dwError);
++    }
++
++    DWORD s_dwCoreBase = 0; //Core.dll's image, to tell its package-DLL probes apart
++    DWORD s_dwCoreEnd = 0;
++
++    bool IsMissingFile(const wchar_t* const pszName)
++    {
++        const PathCache::EKind Kind = PathCache::Lookup(pszName).Kind;
++        return Kind == PathCache::EKind::NoFile || Kind == PathCache::EKind::NoPath;
++    }
++
++    //Core binds every package it loads to a native DLL of the same name,
++    //trying "<System>\<Package>", "<System>\<Package>.dll" and
++    //"_<System>\<Package>.dll" - the last one can never exist (a ':' past
++    //the drive letter). Most packages have no DLL, and each failed
++    //LoadLibrary is a search that costs Wine 10-80 ms on the tablet. Only
++    //Core's calls are answered, and only where the cache rules the file out.
++    bool KnownMissingModule(const wchar_t* const pszName, const void* const pReturn)
++    {
++        const DWORD dwCaller = reinterpret_cast<DWORD>(pReturn);
++        if (!s_bUseCache || !pszName || dwCaller < s_dwCoreBase || dwCaller >= s_dwCoreEnd)
++        {
++            return false;
++        }
++        const size_t iLen = wcslen(pszName);
++        if (iLen < 3 || iLen >= MAX_PATH - 4)
++        {
++            return false;
++        }
++        if (pszName[0] != L'\\' && wcschr(pszName + 2, L':') != nullptr)
++        {
++            return true; //Not a valid path at all
++        }
++        if (pszName[1] != L':' || pszName[2] != L'\\' || !IsMissingFile(pszName))
++        {
++            return false; //Relative names go through the DLL search path: left to the loader
++        }
++        //Without an extension the loader also tries <name>.dll
++        const wchar_t* const pszFile = wcsrchr(pszName, L'\\') + 1;
++        if (wcschr(pszFile, L'.') == nullptr)
++        {
++            wchar_t szDll[MAX_PATH];
++            swprintf_s(szDll, L"%s.dll", pszName);
++            return IsMissingFile(szDll);
++        }
++        return true;
++    }
++
++    bool IsReadOnlyOpen(const DWORD dwAccess, const DWORD dwDisposition, const DWORD dwFlags)
++    {
++        constexpr DWORD dwWriteAccess = GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA
++            | FILE_WRITE_ATTRIBUTES | DELETE | WRITE_DAC | WRITE_OWNER;
++        return dwDisposition == OPEN_EXISTING && (dwAccess & dwWriteAccess) == 0 && (dwFlags & FILE_FLAG_DELETE_ON_CLOSE) == 0;
++    }
++
++    template <class F>
++    F Original(const int iApi)
++    {
++        return reinterpret_cast<F>(s_aTargets[iApi].pfnOriginal);
++    }
++
++    void RescanAfterLoad(HMODULE hModule);
++
++    // ---- hooks ----
++
++    HANDLE WINAPI Hook_CreateFileW(LPCWSTR pszName, DWORD dwAccess, DWORD dwShare, LPSECURITY_ATTRIBUTES pSecurity, DWORD dwDisposition, DWORD dwFlags, HANDLE hTemplate)
++    {
++        const auto pfn = Original<decltype(&CreateFileW)>(Api_CreateFileW);
++        if (!s_bActive)
++        {
++            return pfn(pszName, dwAccess, dwShare, pSecurity, dwDisposition, dwFlags, hTemplate);
++        }
++        const FCall Call(Api_CreateFileW, _ReturnAddress(), _AddressOfReturnAddress());
++        const bool bReadOnly = IsReadOnlyOpen(dwAccess, dwDisposition, dwFlags);
++        DWORD dwError;
++        if (bReadOnly && KnownMissing(pszName, dwError))
++        {
++            Call.Done(false, pszName, true);
++            SetLastError(dwError);
++            return INVALID_HANDLE_VALUE;
++        }
++        const HANDLE hFile = pfn(pszName, dwAccess, dwShare, pSecurity, dwDisposition, dwFlags, hTemplate);
++        if (!bReadOnly)
++        {
++            Invalidate(pszName);
++        }
++        Call.Done(hFile != INVALID_HANDLE_VALUE, pszName);
++        return hFile;
++    }
++
++    HANDLE WINAPI Hook_CreateFileA(LPCSTR pszName, DWORD dwAccess, DWORD dwShare, LPSECURITY_ATTRIBUTES pSecurity, DWORD dwDisposition, DWORD dwFlags, HANDLE hTemplate)
++    {
++        const auto pfn = Original<decltype(&CreateFileA)>(Api_CreateFileA);
++        if (!s_bActive)
++        {
++            return pfn(pszName, dwAccess, dwShare, pSecurity, dwDisposition, dwFlags, hTemplate);
++        }
++        const FCall Call(Api_CreateFileA, _ReturnAddress(), _AddressOfReturnAddress());
++        wchar_t szWide[MAX_PATH];
++        const wchar_t* const pszWide = Widen(pszName, szWide);
++        const bool bReadOnly = IsReadOnlyOpen(dwAccess, dwDisposition, dwFlags);
++        DWORD dwError;
++        if (bReadOnly && KnownMissing(pszWide, dwError))
++        {
++            Call.Done(false, pszWide, true);
++            SetLastError(dwError);
++            return INVALID_HANDLE_VALUE;
++        }
++        const HANDLE hFile = pfn(pszName, dwAccess, dwShare, pSecurity, dwDisposition, dwFlags, hTemplate);
++        if (!bReadOnly)
++        {
++            Invalidate(pszWide);
++        }
++        Call.Done(hFile != INVALID_HANDLE_VALUE, pszWide);
++        return hFile;
++    }
++
++    DWORD WINAPI Hook_GetFileAttributesW(LPCWSTR pszName)
++    {
++        const auto pfn = Original<decltype(&GetFileAttributesW)>(Api_GetFileAttributesW);
++        if (!s_bActive)
++        {
++            return pfn(pszName);
++        }
++        const FCall Call(Api_GetFileAttributesW, _ReturnAddress(), _AddressOfReturnAddress());
++        DWORD dwError;
++        if (KnownMissing(pszName, dwError))
++        {
++            Call.Done(false, pszName, true);
++            SetLastError(dwError);
++            return INVALID_FILE_ATTRIBUTES;
++        }
++        const DWORD dwResult = pfn(pszName);
++        Call.Done(dwResult != INVALID_FILE_ATTRIBUTES, pszName);
++        return dwResult;
++    }
++
++    DWORD WINAPI Hook_GetFileAttributesA(LPCSTR pszName)
++    {
++        const auto pfn = Original<decltype(&GetFileAttributesA)>(Api_GetFileAttributesA);
++        if (!s_bActive)
++        {
++            return pfn(pszName);
++        }
++        const FCall Call(Api_GetFileAttributesA, _ReturnAddress(), _AddressOfReturnAddress());
++        wchar_t szWide[MAX_PATH];
++        const wchar_t* const pszWide = Widen(pszName, szWide);
++        DWORD dwError;
++        if (KnownMissing(pszWide, dwError))
++        {
++            Call.Done(false, pszWide, true);
++            SetLastError(dwError);
++            return INVALID_FILE_ATTRIBUTES;
++        }
++        const DWORD dwResult = pfn(pszName);
++        Call.Done(dwResult != INVALID_FILE_ATTRIBUTES, pszWide);
++        return dwResult;
++    }
++
++    BOOL WINAPI Hook_GetFileAttributesExW(LPCWSTR pszName, GET_FILEEX_INFO_LEVELS Level, LPVOID pInfo)
++    {
++        const auto pfn = Original<decltype(&GetFileAttributesExW)>(Api_GetFileAttributesExW);
++        if (!s_bActive)
++        {
++            return pfn(pszName, Level, pInfo);
++        }
++        const FCall Call(Api_GetFileAttributesExW, _ReturnAddress(), _AddressOfReturnAddress());
++        DWORD dwError;
++        if (KnownMissing(pszName, dwError))
++        {
++            Call.Done(false, pszName, true);
++            SetLastError(dwError);
++            return FALSE;
++        }
++        const BOOL bResult = pfn(pszName, Level, pInfo);
++        Call.Done(bResult != FALSE, pszName);
++        return bResult;
++    }
++
++    BOOL WINAPI Hook_GetFileAttributesExA(LPCSTR pszName, GET_FILEEX_INFO_LEVELS Level, LPVOID pInfo)
++    {
++        const auto pfn = Original<decltype(&GetFileAttributesExA)>(Api_GetFileAttributesExA);
++        if (!s_bActive)
++        {
++            return pfn(pszName, Level, pInfo);
++        }
++        const FCall Call(Api_GetFileAttributesExA, _ReturnAddress(), _AddressOfReturnAddress());
++        wchar_t szWide[MAX_PATH];
++        const wchar_t* const pszWide = Widen(pszName, szWide);
++        DWORD dwError;
++        if (KnownMissing(pszWide, dwError))
++        {
++            Call.Done(false, pszWide, true);
++            SetLastError(dwError);
++            return FALSE;
++        }
++        const BOOL bResult = pfn(pszName, Level, pInfo);
++        Call.Done(bResult != FALSE, pszWide);
++        return bResult;
++    }
++
++    //Directory enumeration: traced only.
++    HANDLE WINAPI Hook_FindFirstFileW(LPCWSTR pszName, LPWIN32_FIND_DATAW pData)
++    {
++        const auto pfn = Original<decltype(&FindFirstFileW)>(Api_FindFirstFileW);
++        if (!s_bActive)
++        {
++            return pfn(pszName, pData);
++        }
++        const FCall Call(Api_FindFirstFileW, _ReturnAddress(), _AddressOfReturnAddress());
++        const HANDLE hFind = pfn(pszName, pData);
++        Call.Done(hFind != INVALID_HANDLE_VALUE, pszName);
++        return hFind;
++    }
++
++    HANDLE WINAPI Hook_FindFirstFileA(LPCSTR pszName, LPWIN32_FIND_DATAA pData)
++    {
++        const auto pfn = Original<decltype(&FindFirstFileA)>(Api_FindFirstFileA);
++        if (!s_bActive)
++        {
++            return pfn(pszName, pData);
++        }
++        const FCall Call(Api_FindFirstFileA, _ReturnAddress(), _AddressOfReturnAddress());
++        const HANDLE hFind = pfn(pszName, pData);
++        wchar_t szWide[MAX_PATH];
++        Call.Done(hFind != INVALID_HANDLE_VALUE, Widen(pszName, szWide));
++        return hFind;
++    }
++
++    HANDLE WINAPI Hook_FindFirstFileExW(LPCWSTR pszName, FINDEX_INFO_LEVELS Level, LPVOID pData, FINDEX_SEARCH_OPS Op, LPVOID pFilter, DWORD dwFlags)
++    {
++        const auto pfn = Original<decltype(&FindFirstFileExW)>(Api_FindFirstFileExW);
++        if (!s_bActive)
++        {
++            return pfn(pszName, Level, pData, Op, pFilter, dwFlags);
++        }
++        const FCall Call(Api_FindFirstFileExW, _ReturnAddress(), _AddressOfReturnAddress());
++        const HANDLE hFind = pfn(pszName, Level, pData, Op, pFilter, dwFlags);
++        Call.Done(hFind != INVALID_HANDLE_VALUE, pszName);
++        return hFind;
++    }
++
++    HANDLE WINAPI Hook_FindFirstFileExA(LPCSTR pszName, FINDEX_INFO_LEVELS Level, LPVOID pData, FINDEX_SEARCH_OPS Op, LPVOID pFilter, DWORD dwFlags)
++    {
++        const auto pfn = Original<decltype(&FindFirstFileExA)>(Api_FindFirstFileExA);
++        if (!s_bActive)
++        {
++            return pfn(pszName, Level, pData, Op, pFilter, dwFlags);
++        }
++        const FCall Call(Api_FindFirstFileExA, _ReturnAddress(), _AddressOfReturnAddress());
++        const HANDLE hFind = pfn(pszName, Level, pData, Op, pFilter, dwFlags);
++        wchar_t szWide[MAX_PATH];
++        Call.Done(hFind != INVALID_HANDLE_VALUE, Widen(pszName, szWide));
++        return hFind;
++    }
++
++    //Calls that change the file system: traced (by destination), and the cache forgets the affected directories.
++    BOOL WINAPI Hook_CopyFileW(LPCWSTR pszSource, LPCWSTR pszDest, BOOL bFailIfExists)
++    {
++        const auto pfn = Original<decltype(&CopyFileW)>(Api_CopyFileW);
++        if (!s_bActive)
++        {
++            return pfn(pszSource, pszDest, bFailIfExists);
++        }
++        const FCall Call(Api_CopyFileW, _ReturnAddress(), _AddressOfReturnAddress());
++        const BOOL bResult = pfn(pszSource, pszDest, bFailIfExists);
++        Invalidate(pszDest);
++        Call.Done(bResult != FALSE, pszDest);
++        return bResult;
++    }
++
++    BOOL WINAPI Hook_CopyFileA(LPCSTR pszSource, LPCSTR pszDest, BOOL bFailIfExists)
++    {
++        const auto pfn = Original<decltype(&CopyFileA)>(Api_CopyFileA);
++        if (!s_bActive)
++        {
++            return pfn(pszSource, pszDest, bFailIfExists);
++        }
++        const FCall Call(Api_CopyFileA, _ReturnAddress(), _AddressOfReturnAddress());
++        const BOOL bResult = pfn(pszSource, pszDest, bFailIfExists);
++        wchar_t szWide[MAX_PATH];
++        const wchar_t* const pszWide = Widen(pszDest, szWide);
++        Invalidate(pszWide);
++        Call.Done(bResult != FALSE, pszWide);
++        return bResult;
++    }
++
++    BOOL WINAPI Hook_CopyFileExW(LPCWSTR pszSource, LPCWSTR pszDest, LPPROGRESS_ROUTINE pfnProgress, LPVOID pData, LPBOOL pbCancel, DWORD dwFlags)
++    {
++        const auto pfn = Original<decltype(&CopyFileExW)>(Api_CopyFileExW);
++        if (!s_bActive)
++        {
++            return pfn(pszSource, pszDest, pfnProgress, pData, pbCancel, dwFlags);
++        }
++        const FCall Call(Api_CopyFileExW, _ReturnAddress(), _AddressOfReturnAddress());
++        const BOOL bResult = pfn(pszSource, pszDest, pfnProgress, pData, pbCancel, dwFlags);
++        Invalidate(pszDest);
++        Call.Done(bResult != FALSE, pszDest);
++        return bResult;
++    }
++
++    BOOL WINAPI Hook_CopyFileExA(LPCSTR pszSource, LPCSTR pszDest, LPPROGRESS_ROUTINE pfnProgress, LPVOID pData, LPBOOL pbCancel, DWORD dwFlags)
++    {
++        const auto pfn = Original<decltype(&CopyFileExA)>(Api_CopyFileExA);
++        if (!s_bActive)
++        {
++            return pfn(pszSource, pszDest, pfnProgress, pData, pbCancel, dwFlags);
++        }
++        const FCall Call(Api_CopyFileExA, _ReturnAddress(), _AddressOfReturnAddress());
++        const BOOL bResult = pfn(pszSource, pszDest, pfnProgress, pData, pbCancel, dwFlags);
++        wchar_t szWide[MAX_PATH];
++        const wchar_t* const pszWide = Widen(pszDest, szWide);
++        Invalidate(pszWide);
++        Call.Done(bResult != FALSE, pszWide);
++        return bResult;
++    }
++
++    BOOL WINAPI Hook_MoveFileW(LPCWSTR pszSource, LPCWSTR pszDest)
++    {
++        const auto pfn = Original<decltype(&MoveFileW)>(Api_MoveFileW);
++        if (!s_bActive)
++        {
++            return pfn(pszSource, pszDest);
++        }
++        const FCall Call(Api_MoveFileW, _ReturnAddress(), _AddressOfReturnAddress());
++        const BOOL bResult = pfn(pszSource, pszDest);
++        Invalidate(pszSource);
++        Invalidate(pszDest);
++        Call.Done(bResult != FALSE, pszDest);
++        return bResult;
++    }
++
++    BOOL WINAPI Hook_MoveFileA(LPCSTR pszSource, LPCSTR pszDest)
++    {
++        const auto pfn = Original<decltype(&MoveFileA)>(Api_MoveFileA);
++        if (!s_bActive)
++        {
++            return pfn(pszSource, pszDest);
++        }
++        const FCall Call(Api_MoveFileA, _ReturnAddress(), _AddressOfReturnAddress());
++        const BOOL bResult = pfn(pszSource, pszDest);
++        wchar_t szWideSource[MAX_PATH];
++        wchar_t szWideDest[MAX_PATH];
++        const wchar_t* const pszWideDest = Widen(pszDest, szWideDest);
++        Invalidate(Widen(pszSource, szWideSource));
++        Invalidate(pszWideDest);
++        Call.Done(bResult != FALSE, pszWideDest);
++        return bResult;
++    }
++
++    BOOL WINAPI Hook_MoveFileExW(LPCWSTR pszSource, LPCWSTR pszDest, DWORD dwFlags)
++    {
++        const auto pfn = Original<decltype(&MoveFileExW)>(Api_MoveFileExW);
++        if (!s_bActive)
++        {
++            return pfn(pszSource, pszDest, dwFlags);
++        }
++        const FCall Call(Api_MoveFileExW, _ReturnAddress(), _AddressOfReturnAddress());
++        const BOOL bResult = pfn(pszSource, pszDest, dwFlags);
++        Invalidate(pszSource);
++        if (pszDest) //Null: delete (at reboot)
++        {
++            Invalidate(pszDest);
++        }
++        Call.Done(bResult != FALSE, pszDest ? pszDest : pszSource);
++        return bResult;
++    }
++
++    BOOL WINAPI Hook_MoveFileExA(LPCSTR pszSource, LPCSTR pszDest, DWORD dwFlags)
++    {
++        const auto pfn = Original<decltype(&MoveFileExA)>(Api_MoveFileExA);
++        if (!s_bActive)
++        {
++            return pfn(pszSource, pszDest, dwFlags);
++        }
++        const FCall Call(Api_MoveFileExA, _ReturnAddress(), _AddressOfReturnAddress());
++        const BOOL bResult = pfn(pszSource, pszDest, dwFlags);
++        wchar_t szWideSource[MAX_PATH];
++        wchar_t szWideDest[MAX_PATH];
++        const wchar_t* const pszWideSource = Widen(pszSource, szWideSource);
++        Invalidate(pszWideSource);
++        const wchar_t* pszWideDest = nullptr;
++        if (pszDest)
++        {
++            pszWideDest = Widen(pszDest, szWideDest);
++            Invalidate(pszWideDest);
++        }
++        Call.Done(bResult != FALSE, pszWideDest ? pszWideDest : pszWideSource);
++        return bResult;
++    }
++
++    BOOL WINAPI Hook_DeleteFileW(LPCWSTR pszName)
++    {
++        const auto pfn = Original<decltype(&DeleteFileW)>(Api_DeleteFileW);
++        if (!s_bActive)
++        {
++            return pfn(pszName);
++        }
++        const FCall Call(Api_DeleteFileW, _ReturnAddress(), _AddressOfReturnAddress());
++        const BOOL bResult = pfn(pszName);
++        Invalidate(pszName);
++        Call.Done(bResult != FALSE, pszName);
++        return bResult;
++    }
++
++    BOOL WINAPI Hook_DeleteFileA(LPCSTR pszName)
++    {
++        const auto pfn = Original<decltype(&DeleteFileA)>(Api_DeleteFileA);
++        if (!s_bActive)
++        {
++            return pfn(pszName);
++        }
++        const FCall Call(Api_DeleteFileA, _ReturnAddress(), _AddressOfReturnAddress());
++        const BOOL bResult = pfn(pszName);
++        wchar_t szWide[MAX_PATH];
++        const wchar_t* const pszWide = Widen(pszName, szWide);
++        Invalidate(pszWide);
++        Call.Done(bResult != FALSE, pszWide);
++        return bResult;
++    }
++
++    BOOL WINAPI Hook_CreateDirectoryW(LPCWSTR pszName, LPSECURITY_ATTRIBUTES pSecurity)
++    {
++        const auto pfn = Original<decltype(&CreateDirectoryW)>(Api_CreateDirectoryW);
++        if (!s_bActive)
++        {
++            return pfn(pszName, pSecurity);
++        }
++        const FCall Call(Api_CreateDirectoryW, _ReturnAddress(), _AddressOfReturnAddress());
++        const BOOL bResult = pfn(pszName, pSecurity);
++        Invalidate(pszName);
++        Call.Done(bResult != FALSE, pszName);
++        return bResult;
++    }
++
++    BOOL WINAPI Hook_CreateDirectoryA(LPCSTR pszName, LPSECURITY_ATTRIBUTES pSecurity)
++    {
++        const auto pfn = Original<decltype(&CreateDirectoryA)>(Api_CreateDirectoryA);
++        if (!s_bActive)
++        {
++            return pfn(pszName, pSecurity);
++        }
++        const FCall Call(Api_CreateDirectoryA, _ReturnAddress(), _AddressOfReturnAddress());
++        const BOOL bResult = pfn(pszName, pSecurity);
++        wchar_t szWide[MAX_PATH];
++        const wchar_t* const pszWide = Widen(pszName, szWide);
++        Invalidate(pszWide);
++        Call.Done(bResult != FALSE, pszWide);
++        return bResult;
++    }
++
++    BOOL WINAPI Hook_RemoveDirectoryW(LPCWSTR pszName)
++    {
++        const auto pfn = Original<decltype(&RemoveDirectoryW)>(Api_RemoveDirectoryW);
++        if (!s_bActive)
++        {
++            return pfn(pszName);
++        }
++        const FCall Call(Api_RemoveDirectoryW, _ReturnAddress(), _AddressOfReturnAddress());
++        const BOOL bResult = pfn(pszName);
++        Invalidate(pszName);
++        Call.Done(bResult != FALSE, pszName);
++        return bResult;
++    }
++
++    BOOL WINAPI Hook_RemoveDirectoryA(LPCSTR pszName)
++    {
++        const auto pfn = Original<decltype(&RemoveDirectoryA)>(Api_RemoveDirectoryA);
++        if (!s_bActive)
++        {
++            return pfn(pszName);
++        }
++        const FCall Call(Api_RemoveDirectoryA, _ReturnAddress(), _AddressOfReturnAddress());
++        const BOOL bResult = pfn(pszName);
++        wchar_t szWide[MAX_PATH];
++        const wchar_t* const pszWide = Widen(pszName, szWide);
++        Invalidate(pszWide);
++        Call.Done(bResult != FALSE, pszWide);
++        return bResult;
++    }
++
++    //Module loads: traced, and new modules get their imports patched.
++    HMODULE WINAPI Hook_LoadLibraryW(LPCWSTR pszName)
++    {
++        const auto pfn = Original<decltype(&LoadLibraryW)>(Api_LoadLibraryW);
++        if (!s_bActive)
++        {
++            return pfn(pszName);
++        }
++        const FCall Call(Api_LoadLibraryW, _ReturnAddress(), _AddressOfReturnAddress());
++        if (KnownMissingModule(pszName, _ReturnAddress()))
++        {
++            Call.Done(false, pszName, true);
++            SetLastError(ERROR_MOD_NOT_FOUND);
++            return nullptr;
++        }
++        const HMODULE hModule = pfn(pszName);
++        RescanAfterLoad(hModule);
++        Call.Done(hModule != nullptr, pszName);
++        return hModule;
++    }
++
++    HMODULE WINAPI Hook_LoadLibraryA(LPCSTR pszName)
++    {
++        const auto pfn = Original<decltype(&LoadLibraryA)>(Api_LoadLibraryA);
++        if (!s_bActive)
++        {
++            return pfn(pszName);
++        }
++        const FCall Call(Api_LoadLibraryA, _ReturnAddress(), _AddressOfReturnAddress());
++        const HMODULE hModule = pfn(pszName);
++        RescanAfterLoad(hModule);
++        wchar_t szWide[MAX_PATH];
++        Call.Done(hModule != nullptr, Widen(pszName, szWide));
++        return hModule;
++    }
++
++    HMODULE WINAPI Hook_LoadLibraryExW(LPCWSTR pszName, HANDLE hFile, DWORD dwFlags)
++    {
++        const auto pfn = Original<decltype(&LoadLibraryExW)>(Api_LoadLibraryExW);
++        if (!s_bActive)
++        {
++            return pfn(pszName, hFile, dwFlags);
++        }
++        const FCall Call(Api_LoadLibraryExW, _ReturnAddress(), _AddressOfReturnAddress());
++        const HMODULE hModule = pfn(pszName, hFile, dwFlags);
++        RescanAfterLoad(hModule);
++        Call.Done(hModule != nullptr, pszName);
++        return hModule;
++    }
++
++    HMODULE WINAPI Hook_LoadLibraryExA(LPCSTR pszName, HANDLE hFile, DWORD dwFlags)
++    {
++        const auto pfn = Original<decltype(&LoadLibraryExA)>(Api_LoadLibraryExA);
++        if (!s_bActive)
++        {
++            return pfn(pszName, hFile, dwFlags);
++        }
++        const FCall Call(Api_LoadLibraryExA, _ReturnAddress(), _AddressOfReturnAddress());
++        const HMODULE hModule = pfn(pszName, hFile, dwFlags);
++        RescanAfterLoad(hModule);
++        wchar_t szWide[MAX_PATH];
++        Call.Done(hModule != nullptr, Widen(pszName, szWide));
++        return hModule;
++    }
++
++    // ---- import patching ----
++
++    DWORD ImageSize(const HMODULE hModule)
++    {
++        __try
++        {
++            const BYTE* const pBase = reinterpret_cast<const BYTE*>(hModule);
++            const IMAGE_DOS_HEADER* const pDos = reinterpret_cast<const IMAGE_DOS_HEADER*>(pBase);
++            if (pDos->e_magic != IMAGE_DOS_SIGNATURE)
++            {
++                return 0;
++            }
++            const IMAGE_NT_HEADERS32* const pNt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(pBase + pDos->e_lfanew);
++            return pNt->Signature == IMAGE_NT_SIGNATURE ? pNt->OptionalHeader.SizeOfImage : 0;
++        }
++        __except (EXCEPTION_EXECUTE_HANDLER)
++        {
++            return 0;
++        }
++    }
++
++    //Points every import slot holding a target at its hook (pfnFind == null),
++    //or counts the slots holding pfnFind. SEH-guarded, so no C++ objects here.
++    int WalkImports(BYTE* const pBase, const void* const pfnFind)
++    {
++        __try
++        {
++            const IMAGE_DOS_HEADER* const pDos = reinterpret_cast<const IMAGE_DOS_HEADER*>(pBase);
++            if (pDos->e_magic != IMAGE_DOS_SIGNATURE)
++            {
++                return 0;
++            }
++            const IMAGE_NT_HEADERS32* const pNt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(pBase + pDos->e_lfanew);
++            if (pNt->Signature != IMAGE_NT_SIGNATURE || pNt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC)
++            {
++                return 0;
++            }
++            const IMAGE_DATA_DIRECTORY& Dir = pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
++            if (!Dir.VirtualAddress || !Dir.Size)
++            {
++                return 0;
++            }
++            int iCount = 0;
++            for (const IMAGE_IMPORT_DESCRIPTOR* pDesc = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(pBase + Dir.VirtualAddress); pDesc->Name; ++pDesc)
++            {
++                if (!pDesc->FirstThunk)
++                {
++                    continue;
++                }
++                for (IMAGE_THUNK_DATA32* pThunk = reinterpret_cast<IMAGE_THUNK_DATA32*>(pBase + pDesc->FirstThunk); pThunk->u1.Function; ++pThunk)
++                {
++                    void* const pfn = reinterpret_cast<void*>(static_cast<ULONG_PTR>(pThunk->u1.Function));
++                    if (pfnFind)
++                    {
++                        iCount += pfn == pfnFind ? 1 : 0;
++                        continue;
++                    }
++                    for (const FTarget& Target : s_aTargets)
++                    {
++                        if (!Target.pfnOriginal || (pfn != Target.pfnOriginal && pfn != Target.pfnAlt))
++                        {
++                            continue;
++                        }
++                        DWORD dwOld;
++                        if (VirtualProtect(&pThunk->u1.Function, sizeof(pThunk->u1.Function), PAGE_EXECUTE_READWRITE, &dwOld))
++                        {
++                            pThunk->u1.Function = reinterpret_cast<DWORD>(Target.pfnHook);
++                            VirtualProtect(&pThunk->u1.Function, sizeof(pThunk->u1.Function), dwOld, &dwOld);
++                            ++iCount;
++                        }
++                        break;
++                    }
++                }
++            }
++            return iCount;
++        }
++        __except (EXCEPTION_EXECUTE_HANDLER)
++        {
++            return 0;
++        }
++    }
++
++    void UpdateModuleTable(const HMODULE* const ahModules, const int iCount)
++    {
++        FModuleTable Table;
++        Table.iCount = 0;
++        for (int i = 0; i < iCount && Table.iCount < static_cast<int>(_countof(Table.aRanges)); ++i)
++        {
++            const DWORD dwSize = ImageSize(ahModules[i]);
++            if (dwSize)
++            {
++                const DWORD dwBase = reinterpret_cast<DWORD>(ahModules[i]);
++                Table.aRanges[Table.iCount++] = { dwBase, dwBase + dwSize };
++            }
++        }
++        std::sort(Table.aRanges, Table.aRanges + Table.iCount, [](const FModuleRange& a, const FModuleRange& b) { return a.dwBase < b.dwBase; });
++
++        const FModuleTable* const pOld = s_pModules;
++        if (pOld && pOld->iCount == Table.iCount && memcmp(pOld->aRanges, Table.aRanges, Table.iCount * sizeof(FModuleRange)) == 0)
++        {
++            return;
++        }
++        FModuleTable* const pNew = static_cast<FModuleTable*>(VirtualAlloc(nullptr, sizeof(FModuleTable), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
++        if (pNew)
++        {
++            *pNew = Table;
++            InterlockedExchangePointer(reinterpret_cast<PVOID volatile*>(&s_pModules), pNew);
++        }
++    }
++
++    //Needs s_csPatch.
++    void PatchAllModules()
++    {
++        HMODULE ahModules[512];
++        DWORD cbNeeded = 0;
++        if (!EnumProcessModules(GetCurrentProcess(), ahModules, sizeof(ahModules), &cbNeeded))
++        {
++            return;
++        }
++        const int iCount = std::min<int>(cbNeeded / sizeof(HMODULE), _countof(ahModules));
++        UpdateModuleTable(ahModules, iCount);
++        for (int i = 0; i < iCount; ++i)
++        {
++            if (ahModules[i] != s_hKernel32 && ahModules[i] != s_hKernelBase && ahModules[i] != s_hNtdll)
++            {
++                s_lPatchedSlots += WalkImports(reinterpret_cast<BYTE*>(ahModules[i]), nullptr);
++            }
++        }
++    }
++
++    void RescanAfterLoad(const HMODULE hModule)
++    {
++        //Datafile/resource mappings (low bits set) aren't loaded modules
++        if (!hModule || (reinterpret_cast<UINT_PTR>(hModule) & 3) != 0)
++        {
++            return;
++        }
++        const FModuleTable* const pTable = s_pModules;
++        if (pTable && InModule(*pTable, reinterpret_cast<DWORD>(hModule)))
++        {
++            return; //Known already, so are its dependencies
++        }
++        const DWORD dwError = GetLastError();
++        EnterCriticalSection(&s_csPatch);
++        PatchAllModules();
++        LeaveCriticalSection(&s_csPatch);
++        SetLastError(dwError);
++    }
++
++    std::wstring ApiName(const int iApi)
++    {
++        const char* const psz = s_aTargets[iApi].pszName;
++        return std::wstring(psz, psz + strlen(psz));
++    }
++
++    struct FAggregate
++    {
++        LONG lCount = 0;
++        LONG lFailed = 0;
++        LONG lCached = 0;
++        LONGLONG llTicks = 0;
++        std::wstring Example;
++    };
++
++    void ReportTrace()
++    {
++        //Take the data and start over, then format without the lock. Allocate
++        //first: nothing that can throw may run while hooks on other threads
++        //wait for the lock.
++        std::vector<FApiStat> Apis(Api_Count);
++        std::vector<FCallerStat> Callers;
++        std::vector<FFileStat> Files;
++        Callers.reserve(MaxCallers);
++        Files.reserve(MaxFiles);
++        LONG lDroppedCallers, lDroppedFiles;
++        AcquireSRWLockExclusive(&s_TraceLock);
++        memcpy(Apis.data(), s_pTrace->aApis, sizeof(s_pTrace->aApis));
++        for (const FCallerStat& Caller : s_pTrace->aCallers)
++        {
++            if (Caller.bUsed)
++            {
++                Callers.push_back(Caller);
++            }
++        }
++        for (const FFileStat& File : s_pTrace->aFiles)
++        {
++            if (File.bUsed)
++            {
++                Files.push_back(File);
++            }
++        }
++        lDroppedCallers = s_pTrace->lDroppedCallers;
++        lDroppedFiles = s_pTrace->lDroppedFiles;
++        memset(s_pTrace, 0, sizeof(FTrace));
++        ReleaseSRWLockExclusive(&s_TraceLock);
++
++        const double dTicksPerSecond = static_cast<double>(s_liFreq.QuadPart);
++        LONG lTotal = 0;
++        LONG lCached = 0;
++        LONGLONG llTotalTicks = 0;
++        for (const FApiStat& Api : Apis)
++        {
++            lTotal += Api.lCount;
++            lCached += Api.lCached;
++            llTotalTicks += Api.llTicks;
++        }
++        GLog->Logf(L"File trace: %i calls, %.2f s in total; %i answered from the path cache.", lTotal, llTotalTicks / dTicksPerSecond, lCached);
++        if (lTotal == 0)
++        {
++            return;
++        }
++
++        std::vector<int> Order;
++        for (int i = 0; i < Api_Count; ++i)
++        {
++            if (Apis[i].lCount > 0)
++            {
++                Order.push_back(i);
++            }
++        }
++        std::sort(Order.begin(), Order.end(), [&Apis](const int a, const int b) { return Apis[a].llTicks > Apis[b].llTicks; });
++        for (const int i : Order)
++        {
++            const FApiStat& Api = Apis[i];
++            GLog->Logf(L"File trace:   %s: %i calls (%i failed, %i from cache), %.2f s, %.2f ms each.", ApiName(i).c_str(),
++                Api.lCount, Api.lFailed, Api.lCached, Api.llTicks / dTicksPerSecond, Api.llTicks * 1000.0 / dTicksPerSecond / Api.lCount);
++        }
++
++        //Callers, merged by what is shown: direct caller plus the next game frames
++        const std::vector<Symbols::ExportTable> Tables = Symbols::BuildExportTables();
++        std::unordered_map<std::wstring, FAggregate> ByChain;
++        for (const FCallerStat& Caller : Callers)
++        {
++            std::wstring Chain = ApiName(Caller.wApi) + L"  " + Symbols::Symbolize(Tables, Caller.aFrames[0]);
++            int iGameFrames = Symbols::IsSystemModule(Symbols::Symbolize(Tables, Caller.aFrames[0], true)) ? 0 : 1;
++            for (int f = 1; f < MaxFrames && Caller.aFrames[f] && iGameFrames < 4; ++f)
++            {
++                if (Symbols::IsSystemModule(Symbols::Symbolize(Tables, Caller.aFrames[f], true)))
++                {
++                    continue;
++                }
++                Chain += L" <- " + Symbols::Symbolize(Tables, Caller.aFrames[f]);
++                ++iGameFrames;
++            }
++            FAggregate& Aggregate = ByChain[Chain];
++            Aggregate.lCount += Caller.lCount;
++            Aggregate.lFailed += Caller.lFailed;
++            Aggregate.lCached += Caller.lCached;
++            Aggregate.llTicks += Caller.llTicks;
++            if (Aggregate.Example.empty())
++            {
++                Aggregate.Example = Caller.szExample;
++            }
++        }
++        std::vector<std::pair<std::wstring, FAggregate>> SortedChains(ByChain.begin(), ByChain.end());
++        std::sort(SortedChains.begin(), SortedChains.end(), [](const auto& a, const auto& b) { return a.second.llTicks > b.second.llTicks; });
++        GLog->Log(L"File trace: --- callers by time ---");
++        for (size_t i = 0; i < SortedChains.size() && i < 20; ++i)
++        {
++            const FAggregate& Aggregate = SortedChains[i].second;
++            GLog->Logf(L"File trace: %5.1f%% %7.2f s %6ix (%i failed, %i from cache)  %s  e.g. '%s'",
++                100.0 * Aggregate.llTicks / std::max<LONGLONG>(llTotalTicks, 1), Aggregate.llTicks / dTicksPerSecond,
++                Aggregate.lCount, Aggregate.lFailed, Aggregate.lCached, SortedChains[i].first.c_str(), Aggregate.Example.c_str());
++        }
++
++        std::sort(Files.begin(), Files.end(), [](const FFileStat& a, const FFileStat& b) { return a.llTicks > b.llTicks; });
++        GLog->Logf(L"File trace: --- files by time (%i distinct) ---", static_cast<INT>(Files.size()));
++        for (size_t i = 0; i < Files.size() && i < 25; ++i)
++        {
++            const FFileStat& File = Files[i];
++            GLog->Logf(L"File trace: %7.2f s %6ix (%i failed, %i from cache)  %s  '%s'", File.llTicks / dTicksPerSecond,
++                File.lCount, File.lFailed, File.lCached, ApiName(File.wApi).c_str(), File.szName);
++        }
++        if (lDroppedCallers || lDroppedFiles)
++        {
++            GLog->Logf(L"File trace: tables full, %i caller and %i file records dropped.", lDroppedCallers, lDroppedFiles);
++        }
++    }
++}
++
++void FileHooks::Install()
++{
++    if (s_bActive)
++    {
++        return;
++    }
++    UBOOL bTrace = FALSE; //Diagnostics only: a stack scan per hooked call
++    GConfig->GetBool(PROJECTNAME, L"FileTrace", bTrace);
++    s_bUseCache = PathCache::Enabled();
++    if (!bTrace && !s_bUseCache)
++    {
++        GLog->Log(L"File hooks: off.");
++        return;
++    }
++    if (bTrace && !s_pTrace)
++    {
++        s_pTrace = static_cast<FTrace*>(VirtualAlloc(nullptr, sizeof(FTrace), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
++    }
++    s_bTrace = bTrace && s_pTrace;
++    QueryPerformanceFrequency(&s_liFreq);
++
++    s_hKernel32 = GetModuleHandleW(L"kernel32.dll");
++    s_hKernelBase = GetModuleHandleW(L"kernelbase.dll");
++    s_hNtdll = GetModuleHandleW(L"ntdll.dll");
++
++    static const struct
++    {
++        const char* pszName;
++        void* pfnHook;
++    } s_aHooks[Api_Count] =
++    {
++        { "CreateFileW", reinterpret_cast<void*>(&Hook_CreateFileW) },
++        { "CreateFileA", reinterpret_cast<void*>(&Hook_CreateFileA) },
++        { "GetFileAttributesW", reinterpret_cast<void*>(&Hook_GetFileAttributesW) },
++        { "GetFileAttributesA", reinterpret_cast<void*>(&Hook_GetFileAttributesA) },
++        { "GetFileAttributesExW", reinterpret_cast<void*>(&Hook_GetFileAttributesExW) },
++        { "GetFileAttributesExA", reinterpret_cast<void*>(&Hook_GetFileAttributesExA) },
++        { "FindFirstFileW", reinterpret_cast<void*>(&Hook_FindFirstFileW) },
++        { "FindFirstFileA", reinterpret_cast<void*>(&Hook_FindFirstFileA) },
++        { "FindFirstFileExW", reinterpret_cast<void*>(&Hook_FindFirstFileExW) },
++        { "FindFirstFileExA", reinterpret_cast<void*>(&Hook_FindFirstFileExA) },
++        { "CopyFileW", reinterpret_cast<void*>(&Hook_CopyFileW) },
++        { "CopyFileA", reinterpret_cast<void*>(&Hook_CopyFileA) },
++        { "CopyFileExW", reinterpret_cast<void*>(&Hook_CopyFileExW) },
++        { "CopyFileExA", reinterpret_cast<void*>(&Hook_CopyFileExA) },
++        { "MoveFileW", reinterpret_cast<void*>(&Hook_MoveFileW) },
++        { "MoveFileA", reinterpret_cast<void*>(&Hook_MoveFileA) },
++        { "MoveFileExW", reinterpret_cast<void*>(&Hook_MoveFileExW) },
++        { "MoveFileExA", reinterpret_cast<void*>(&Hook_MoveFileExA) },
++        { "DeleteFileW", reinterpret_cast<void*>(&Hook_DeleteFileW) },
++        { "DeleteFileA", reinterpret_cast<void*>(&Hook_DeleteFileA) },
++        { "CreateDirectoryW", reinterpret_cast<void*>(&Hook_CreateDirectoryW) },
++        { "CreateDirectoryA", reinterpret_cast<void*>(&Hook_CreateDirectoryA) },
++        { "RemoveDirectoryW", reinterpret_cast<void*>(&Hook_RemoveDirectoryW) },
++        { "RemoveDirectoryA", reinterpret_cast<void*>(&Hook_RemoveDirectoryA) },
++        { "LoadLibraryW", reinterpret_cast<void*>(&Hook_LoadLibraryW) },
++        { "LoadLibraryA", reinterpret_cast<void*>(&Hook_LoadLibraryA) },
++        { "LoadLibraryExW", reinterpret_cast<void*>(&Hook_LoadLibraryExW) },
++        { "LoadLibraryExA", reinterpret_cast<void*>(&Hook_LoadLibraryExA) },
++    };
++    for (int i = 0; i < Api_Count; ++i)
++    {
++        FTarget& Target = s_aTargets[i];
++        Target.pszName = s_aHooks[i].pszName;
++        Target.pfnHook = s_aHooks[i].pfnHook;
++        void* const pfnKernel32 = s_hKernel32 ? reinterpret_cast<void*>(GetProcAddress(s_hKernel32, Target.pszName)) : nullptr;
++        void* const pfnKernelBase = s_hKernelBase ? reinterpret_cast<void*>(GetProcAddress(s_hKernelBase, Target.pszName)) : nullptr;
++        Target.pfnOriginal = pfnKernel32 ? pfnKernel32 : pfnKernelBase;
++        Target.pfnAlt = pfnKernelBase ? pfnKernelBase : pfnKernel32;
++    }
++
++    const HMODULE hCore = GetModuleHandleW(L"Core.dll");
++    s_dwCoreBase = reinterpret_cast<DWORD>(hCore);
++    s_dwCoreEnd = hCore ? s_dwCoreBase + ImageSize(hCore) : 0;
++
++    InitializeCriticalSection(&s_csPatch);
++    s_bActive = true;
++    EnterCriticalSection(&s_csPatch);
++    PatchAllModules();
++    LeaveCriticalSection(&s_csPatch);
++
++    //The cache is only safe while it sees every write. The file manager's
++    //writes go through this module's own imports; if those couldn't be
++    //patched, don't cache.
++    if (s_bUseCache && WalkImports(reinterpret_cast<BYTE*>(GetModuleHandleW(nullptr)), reinterpret_cast<const void*>(&Hook_CreateFileW)) == 0)
++    {
++        s_bUseCache = false;
++        PathCache::Disable();
++        GLog->Log(L"File hooks: own imports not patched; path cache disabled.");
++    }
++    GLog->Logf(L"File hooks: %i import slots patched; trace %s, path cache %s.", s_lPatchedSlots,
++        s_bTrace ? L"on" : L"off", s_bUseCache ? L"on" : L"off");
++}
++
++void FileHooks::Rescan()
++{
++    if (!s_bActive)
++    {
++        return;
++    }
++    EnterCriticalSection(&s_csPatch);
++    PatchAllModules();
++    LeaveCriticalSection(&s_csPatch);
++}
++
++void FileHooks::Report()
++{
++    if (s_bActive && s_bTrace && s_pTrace)
++    {
++        ReportTrace();
++    }
++    PathCache::ReportStats();
++}
++
++void FileHooks::Shutdown()
++{
++    s_bUseCache = false;
++    s_bTrace = false;
++    s_bActive = false;
++    PathCache::Disable();
++}
+diff --git a/launcher/src/FileHooks.h b/launcher/src/FileHooks.h
+new file mode 100644
+index 0000000..d58dea5
+--- /dev/null
++++ b/launcher/src/FileHooks.h
+@@ -0,0 +1,30 @@
++#pragma once
++
++// Import-table hooks on the process's file-system calls - CreateFile,
++// GetFileAttributes(Ex), FindFirstFile(Ex), CopyFile, MoveFile, DeleteFile,
++// Create/RemoveDirectory - in every loaded module (LoadLibrary is hooked too,
++// so modules loaded later get patched as they come in).
++//
++// - Read-only opens and attribute queries of files that PathCache knows
++//   don't exist fail right away with the error the OS would give, instead of
++//   costing Wine a directory scan each. So do Core.dll's attempts to load a
++//   native DLL for every package it binds, where the DLL is known to be
++//   missing. Every call that creates, writes, moves or deletes something
++//   invalidates the cache.
++// - [DeusExe] FileTrace=True (off by default) counts and times all of these calls;
++//   Report() logs the totals, the most expensive callers (direct caller plus
++//   the next return addresses on the stack) and files.
++namespace FileHooks
++{
++    // Main thread, after PathCache::ReadConfig.
++    void Install();
++
++    // Patches modules loaded since the previous scan.
++    void Rescan();
++
++    // Logs what was gathered since the previous call (and the path cache's counters).
++    void Report();
++
++    // Back to plain pass-through, before the engine shuts down.
++    void Shutdown();
++}
+diff --git a/launcher/src/FileManagerDeusExe.cpp b/launcher/src/FileManagerDeusExe.cpp
+index 34f3f0a..365b754 100644
+--- a/launcher/src/FileManagerDeusExe.cpp
++++ b/launcher/src/FileManagerDeusExe.cpp
+@@ -1,6 +1,10 @@
+ #include "stdafx.h"
+ #include "FileManagerDeusExe.h"
+ #include "Misc.h"
++#include "FastFileReader.h"
++#include "FileHooks.h"
++#include "LoadProfiler.h"
++#include "PathCache.h"
+ 
+ const wchar_t* const FFileManagerDeusExe::sm_pszIntPaths = L"IntPaths";
+ 
+@@ -10,6 +14,26 @@ void FFileManagerDeusExe::OnGameStart()
+     //Rebuilt here because the data-directories dialog may have just edited the lists
+     BuildIntPaths();
+     BuildConPaths();
++    FastFileReader::ReadConfig();
++    LoadProfiler::ReadConfig();
++    PathCache::ReadConfig();
++    FileHooks::Install(); //After PathCache: the hooks keep the cache up to date
++}
++
++INT FFileManagerDeusExe::CachedFileSize(const wchar_t* const pszFilename)
++{
++    const PathCache::FInfo Info = PathCache::Lookup(pszFilename);
++    switch (Info.Kind)
++    {
++    case PathCache::EKind::File:
++        return Info.iSize;
++    case PathCache::EKind::NoFile:
++    case PathCache::EKind::NoPath:
++    case PathCache::EKind::Directory: //A directory doesn't open as a file either
++        return -1;
++    default:
++        return FFileManagerWindows::FileSize(pszFilename);
++    }
+ }
+ 
+ void FFileManagerDeusExe::BuildConPaths()
+@@ -198,7 +222,7 @@ bool FFileManagerDeusExe::IntOverride(wchar_t(&szNewName)[MAX_PATH], const wchar
+ FArchive* FFileManagerDeusExe::CreateFileReader(const wchar_t* Filename, DWORD Flags, FOutputDevice* Error)
+ {
+     wchar_t szFilename[MAX_PATH];
+-    return FFileManagerWindows::CreateFileReader(ConOverride(szFilename, Filename) || IntOverride(szFilename, Filename) ? szFilename : Filename, Flags, Error);
++    return FastFileReader::Create(ConOverride(szFilename, Filename) || IntOverride(szFilename, Filename) ? szFilename : Filename, Flags, Error);
+ }
+ 
+ //Same override as CreateFileReader: FConfigCacheIni::Find probes with
+@@ -206,7 +230,7 @@ FArchive* FFileManagerDeusExe::CreateFileReader(const wchar_t* Filename, DWORD F
+ INT FFileManagerDeusExe::FileSize(const wchar_t* Filename)
+ {
+     wchar_t szFilename[MAX_PATH];
+-    return FFileManagerWindows::FileSize(ConOverride(szFilename, Filename) || IntOverride(szFilename, Filename) ? szFilename : Filename);
++    return CachedFileSize(ConOverride(szFilename, Filename) || IntOverride(szFilename, Filename) ? szFilename : Filename);
+ }
+ 
+ bool FFileManagerDeusExe::ToModernFileName(wchar_t(&szNewName)[MAX_PATH], const wchar_t* const pszOldName, const char /*op*/ /*= 'r'*/)
+@@ -305,7 +329,7 @@ FArchive* FFileManagerDeusExeUserDocs::CreateFileReader(const wchar_t* Filename,
+ {
+     assert(Filename);
+     wchar_t szNewFilename[MAX_PATH];
+-    return FFileManagerWindows::CreateFileReader(ConOverride(szNewFilename, Filename) || IntOverride(szNewFilename, Filename) ? szNewFilename : ToModernFileName(szNewFilename, Filename) ? szNewFilename : Filename, Flags, Error);
++    return FastFileReader::Create(ConOverride(szNewFilename, Filename) || IntOverride(szNewFilename, Filename) ? szNewFilename : ToModernFileName(szNewFilename, Filename) ? szNewFilename : Filename, Flags, Error);
+ }
+ 
+ FArchive* FFileManagerDeusExeUserDocs::CreateFileWriter(const wchar_t* Filename, DWORD Flags, FOutputDevice* Error)
+@@ -319,7 +343,7 @@ INT FFileManagerDeusExeUserDocs::FileSize(const wchar_t* Filename)
+ {
+     assert(Filename);
+     wchar_t szNewFilename[MAX_PATH];
+-    return FFileManagerWindows::FileSize(ConOverride(szNewFilename, Filename) || IntOverride(szNewFilename, Filename) ? szNewFilename : ToModernFileName(szNewFilename, Filename) ? szNewFilename : Filename);
++    return CachedFileSize(ConOverride(szNewFilename, Filename) || IntOverride(szNewFilename, Filename) ? szNewFilename : ToModernFileName(szNewFilename, Filename) ? szNewFilename : Filename);
+ }
+ 
+ UBOOL FFileManagerDeusExeUserDocs::Copy(const wchar_t* DestFile, const wchar_t* SrcFile, UBOOL ReplaceExisting, UBOOL EvenIfReadOnly, UBOOL Attributes, void(*Progress)(FLOAT Fraction))
+diff --git a/launcher/src/FileManagerDeusExe.h b/launcher/src/FileManagerDeusExe.h
+index 94d23be..0b7653f 100644
+--- a/launcher/src/FileManagerDeusExe.h
++++ b/launcher/src/FileManagerDeusExe.h
+@@ -46,6 +46,14 @@ protected:
+     */
+     bool ConOverride(wchar_t(&szNewName)[MAX_PATH], const wchar_t* const pszOldName) const;
+ 
++    /**
++    FileSize answered from PathCache's directory listings where it can: the
++    engine asks every search path for every package and localization file,
++    mostly for files that don't exist, and each of those is slow under Wine
++    (see PathCache.h). Falls back to opening the file.
++    */
++    INT CachedFileSize(const wchar_t* const pszFilename);
++
+ private:
+     void BuildIntPaths(); //(Re)reads the IntPaths entries; needs GConfig
+     void BuildConPaths(); //(Re)scans the data directories for conversation packages; needs GSys
+diff --git a/launcher/src/Launcher.cpp b/launcher/src/Launcher.cpp
+index 37d3ce6..63b04e5 100644
+--- a/launcher/src/Launcher.cpp
++++ b/launcher/src/Launcher.cpp
+@@ -1,6 +1,8 @@
+ #include "stdafx.h"
+ #include "ConfigOverride.h"
+ #include "FileManagerDeusExe.h"
++#include "FileHooks.h"
++#include "LoadProfiler.h"
+ #include "Misc.h"
+ #include "RawInput.h"
+ #include "LauncherDialog.h"
+@@ -220,6 +222,10 @@ namespace
+ 
+         GLogHook = NULL; //Never dispatch into the WLog window code from a crashed context, as HandleError also does
+ 
++        //The report opens files; the fault may have hit inside a file hook
++        FileHooks::Shutdown();
++        LoadProfiler::Shutdown();
++
+         CrashContext::LogReport(pExceptionInfo); //Tolerates a null GLog
+ 
+         return EXCEPTION_CONTINUE_SEARCH; //Let Windows error reporting run as it would have
+@@ -337,7 +343,8 @@ INT WINAPI WinMain(HINSTANCE /*hInInstance*/, HINSTANCE /*hPrevInstance*/, LPSTR
+         CLauncher Launcher;
+     }
+ 
+-    //Uninit
++    //Uninit. The file hooks stay patched in but only pass calls through from here on.
++    FileHooks::Shutdown();
+     appPreExit();
+     appExit();
+     GIsStarted = 0;
+@@ -419,6 +426,10 @@ CLauncher::CLauncher()
+         }
+         catch (...)
+         {
++            //The report opens files (dbghelp), and the error may have left
++            //the hooks' state half-updated: from here on they pass calls through.
++            FileHooks::Shutdown();
++            LoadProfiler::Shutdown();
+             //Report before HandleError, which shows the stock message box. A
+             //hardware fault the guard chain caught and rethrew arrives here with
+             //its registers and stack already recorded first-chance; a plain
+diff --git a/launcher/src/LevelWatch.cpp b/launcher/src/LevelWatch.cpp
+index 1589f94..0ae9606 100644
+--- a/launcher/src/LevelWatch.cpp
++++ b/launcher/src/LevelWatch.cpp
+@@ -1,6 +1,9 @@
+ #include "stdafx.h"
+ #include "CrashContext.h"
+ #include "LevelWatch.h"
++#include "FastFileReader.h"
++#include "FileHooks.h"
++#include "LoadProfiler.h"
+ 
+ namespace
+ {
+@@ -18,13 +21,21 @@ namespace
+     }
+ }
+ 
++volatile bool CLevelWatch::sm_bLoadPending = false;
++
++void CLevelWatch::NoteLoadMap()
++{
++    sm_bLoadPending = true;
++}
++
+ void CLevelWatch::Update(UEngine* const pEngine)
+ {
+     UGameEngine* const pGameEngine = Cast<UGameEngine>(pEngine);
+     ULevel* const pLevel = pGameEngine ? pGameEngine->GLevel : nullptr;
+ 
+-    if (pLevel != m_pLevel)
++    if (pLevel != m_pLevel || sm_bLoadPending)
+     {
++        sm_bLoadPending = false;
+         const ULONGLONG ullNow = GetTickCount64();
+         wchar_t szMap[_countof(m_szMap)] = L"<none>";
+         if (pLevel)
+@@ -37,6 +48,12 @@ void CLevelWatch::Update(UEngine* const pEngine)
+             pLevel ? pLevel->Actors.Num() : 0,
+             m_ullLastChangeTick ? (ullNow - m_ullLastChangeTick) / 1000.0 : 0.0);
+ 
++        INT iReads, iSeeks, iKBytes, iMaps, iMapKBytes;
++        FastFileReader::TakeStats(iReads, iSeeks, iKBytes, iMaps, iMapKBytes);
++        GLog->Logf(L"File I/O since the previous change: %i reads, %i seeks, %i KB read; %i files mapped (%i KB).", iReads, iSeeks, iKBytes, iMaps, iMapKBytes);
++        FileHooks::Report();
++        LoadProfiler::OnLoadEnd();
++
+         wcscpy_s(m_szMap, szMap);
+         m_pLevel = pLevel;
+         m_ullLastChangeTick = ullNow;
+diff --git a/launcher/src/LevelWatch.h b/launcher/src/LevelWatch.h
+index e464c93..9ecd17a 100644
+--- a/launcher/src/LevelWatch.h
++++ b/launcher/src/LevelWatch.h
+@@ -9,7 +9,15 @@ class CLevelWatch
+ public:
+     void Update(UEngine* const pEngine); //Call once per frame, after Tick()
+ 
++    //The engine logged "LoadMap: ". LoadMap runs synchronously within one
++    //Tick(), so the next Update() reports the load as done - also when the
++    //new level reuses the old one's address (reloading a save of the same
++    //map) or the load failed and the old level stays.
++    static void NoteLoadMap();
++
+ private:
++    static volatile bool sm_bLoadPending;
++
+     const void* m_pLevel = nullptr; //Identity only: the level can be garbage collected, so never dereferenced
+     ULONGLONG m_ullLastChangeTick = 0;
+     wchar_t m_szMap[128] = {};
+diff --git a/launcher/src/LoadProfiler.cpp b/launcher/src/LoadProfiler.cpp
+new file mode 100644
+index 0000000..c31e11c
+--- /dev/null
++++ b/launcher/src/LoadProfiler.cpp
+@@ -0,0 +1,454 @@
++#include "stdafx.h"
++#include "LoadProfiler.h"
++#include "Symbols.h"
++
++#include <psapi.h>
++#pragma comment(lib, "psapi.lib")
++#include <tlhelp32.h>
++#include <algorithm>
++#include <map>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++namespace
++{
++    constexpr DWORD SampleIntervalMs = 15;
++    constexpr size_t MaxSamples = 40000;          // ~10 min at 15 ms
++    constexpr size_t MaxFrames = 16;
++    constexpr size_t StackCopyBytes = 16 * 1024;
++
++    struct Sample
++    {
++        DWORD Eip;
++        DWORD Frames[MaxFrames];
++        BYTE FrameCount;
++    };
++
++    struct ModuleRange
++    {
++        DWORD Base;
++        DWORD End;
++    };
++
++    bool s_bEnabled = true;
++    HANDLE s_hMainThread = nullptr;
++    DWORD s_dwMainThreadId = 0;
++    HANDLE s_hSampler = nullptr;
++    HANDLE s_hWake = nullptr;                    // auto-reset: start sampling
++    volatile LONG s_lSampling = 0;               // 1 while a map loads
++    volatile LONG s_lSamplerIdle = 1;            // 1 when the sampler is not touching the buffers
++    DWORD s_dwStackBase = 0;                     // main thread stack range
++    DWORD s_dwStackLimit = 0;
++
++    Sample* s_pSamples = nullptr;                // preallocated, no allocation while sampling
++    volatile LONG s_lSampleCount = 0;
++    volatile LONG s_lSuspendFailures = 0;
++    volatile LONG s_lContextFailures = 0;
++    BYTE* s_pStackCopy = nullptr;
++
++    ModuleRange s_Modules[512];
++    int s_iModuleCount = 0;
++
++    ULONGLONG s_ullBeginTick = 0;
++    FILETIME s_ftMainKernel0 = {}, s_ftMainUser0 = {};
++    // Allocated on first use: UE1 replaces global operator new with GMalloc,
++    // which does not exist yet during static initialization.
++    using ThreadTimes = std::map<DWORD, std::pair<ULONGLONG, ULONGLONG>>;   // tid -> (kernel, user) 100ns
++    ThreadTimes* s_pThreadTimes0 = nullptr;
++
++    ULONGLONG FileTimeToU64(const FILETIME& ft)
++    {
++        return (static_cast<ULONGLONG>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
++    }
++
++    // ---- module table (taken on the main thread, read by the sampler) ----
++
++    void SnapshotModules()
++    {
++        HMODULE hMods[512];
++        DWORD cbNeeded = 0;
++        s_iModuleCount = 0;
++        if (!EnumProcessModules(GetCurrentProcess(), hMods, sizeof(hMods), &cbNeeded))
++        {
++            return;
++        }
++        const int iCount = std::min<int>(cbNeeded / sizeof(HMODULE), _countof(hMods));
++        for (int i = 0; i < iCount; ++i)
++        {
++            MODULEINFO mi = {};
++            if (GetModuleInformation(GetCurrentProcess(), hMods[i], &mi, sizeof(mi)))
++            {
++                s_Modules[s_iModuleCount].Base = reinterpret_cast<DWORD>(mi.lpBaseOfDll);
++                s_Modules[s_iModuleCount].End = s_Modules[s_iModuleCount].Base + mi.SizeOfImage;
++                ++s_iModuleCount;
++            }
++        }
++    }
++
++    // True if the 7 bytes before dwAddr lie in a loaded image, so the CALL
++    // check below can't fault (a module base on the stack would, and each
++    // first-chance fault replaces CrashContext's record of the last real one).
++    bool InModule(DWORD dwAddr)
++    {
++        for (int i = 0; i < s_iModuleCount; ++i)
++        {
++            if (dwAddr >= s_Modules[i].Base + 7 && dwAddr < s_Modules[i].End)
++            {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    // ---- sampler thread ----
++
++    // SEH-only helper (no C++ objects): copy the suspended thread's stack.
++    size_t CopyMemorySafe(BYTE* pDst, const BYTE* pSrc, size_t n)
++    {
++        __try
++        {
++            memcpy(pDst, pSrc, n);
++            return n;
++        }
++        __except (EXCEPTION_EXECUTE_HANDLER)
++        {
++            return 0;
++        }
++    }
++
++    // A return address is preceded by a CALL instruction.
++    bool LooksLikeReturnAddress(DWORD dwAddr)
++    {
++        if (!InModule(dwAddr))
++        {
++            return false;
++        }
++        BYTE b[7] = {};
++        if (CopyMemorySafe(b, reinterpret_cast<const BYTE*>(dwAddr - 7), 7) != 7)
++        {
++            return false;
++        }
++        if (b[2] == 0xE8)                                  // call rel32
++            return true;
++        if (b[1] == 0xFF && (b[2] & 0x38) == 0x10)        // call [disp32] / [reg+disp32]
++            return true;
++        if (b[4] == 0xFF && (b[5] & 0x38) == 0x10)        // call [reg+disp8] / call [reg+reg]
++            return true;
++        if (b[5] == 0xFF && (b[6] & 0xF8) == 0xD0)        // call reg
++            return true;
++        if (b[5] == 0xFF && (b[6] & 0x38) == 0x10)        // call [reg]
++            return true;
++        if (b[0] == 0xFF && (b[1] & 0x38) == 0x10)        // call [reg*scale+disp32]
++            return true;
++        return false;
++    }
++
++    void TakeSample()
++    {
++        const LONG lIndex = s_lSampleCount;
++        if (lIndex >= static_cast<LONG>(MaxSamples))
++        {
++            return;
++        }
++        if (SuspendThread(s_hMainThread) == static_cast<DWORD>(-1))
++        {
++            InterlockedIncrement(&s_lSuspendFailures);
++            return;
++        }
++        CONTEXT ctx = {};
++        ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
++        const BOOL bContext = GetThreadContext(s_hMainThread, &ctx);
++        size_t nCopied = 0;
++        if (bContext && ctx.Esp >= s_dwStackLimit && ctx.Esp < s_dwStackBase)
++        {
++            const size_t nAvail = s_dwStackBase - ctx.Esp;
++            nCopied = CopyMemorySafe(s_pStackCopy, reinterpret_cast<const BYTE*>(ctx.Esp), std::min(nAvail, StackCopyBytes));
++        }
++        ResumeThread(s_hMainThread);
++
++        if (!bContext)
++        {
++            InterlockedIncrement(&s_lContextFailures);
++            return;
++        }
++
++        // Analyse after resuming: no work while the main thread is frozen.
++        Sample& s = s_pSamples[lIndex];
++        s.Eip = ctx.Eip;
++        s.FrameCount = 0;
++        for (size_t off = 0; off + 4 <= nCopied && s.FrameCount < MaxFrames; off += 4)
++        {
++            const DWORD dwValue = *reinterpret_cast<const DWORD*>(s_pStackCopy + off);
++            if (LooksLikeReturnAddress(dwValue))
++            {
++                s.Frames[s.FrameCount++] = dwValue;
++            }
++        }
++        s_lSampleCount = lIndex + 1;
++    }
++
++    DWORD WINAPI SamplerProc(LPVOID)
++    {
++        for (;;)
++        {
++            WaitForSingleObject(s_hWake, INFINITE);
++            InterlockedExchange(&s_lSamplerIdle, 0);
++            for (unsigned n = 0; s_lSampling; ++n)
++            {
++                // Modules loaded mid-load (renderer, audio, their runtimes)
++                // only count as stack frames once they are in the table.
++                if (n % 64 == 63)
++                {
++                    SnapshotModules();
++                }
++                TakeSample();
++                Sleep(SampleIntervalMs);
++            }
++            InterlockedExchange(&s_lSamplerIdle, 1);
++        }
++    }
++
++    // ---- per-thread CPU times ----
++
++    std::map<DWORD, std::pair<ULONGLONG, ULONGLONG>> SnapshotThreadTimes()
++    {
++        std::map<DWORD, std::pair<ULONGLONG, ULONGLONG>> times;
++        const HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
++        if (hSnap == INVALID_HANDLE_VALUE)
++        {
++            return times;
++        }
++        THREADENTRY32 te = {};
++        te.dwSize = sizeof(te);
++        const DWORD dwPid = GetCurrentProcessId();
++        for (BOOL b = Thread32First(hSnap, &te); b; b = Thread32Next(hSnap, &te))
++        {
++            if (te.th32OwnerProcessID != dwPid)
++                continue;
++            const HANDLE hThread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
++            if (!hThread)
++                continue;
++            FILETIME ftC, ftE, ftK, ftU;
++            if (GetThreadTimes(hThread, &ftC, &ftE, &ftK, &ftU))
++            {
++                times[te.th32ThreadID] = { FileTimeToU64(ftK), FileTimeToU64(ftU) };
++            }
++            CloseHandle(hThread);
++        }
++        CloseHandle(hSnap);
++        return times;
++    }
++
++    std::wstring ThreadName(DWORD dwTid)
++    {
++        std::wstring name;
++        using PFN_GetThreadDescription = HRESULT(WINAPI*)(HANDLE, PWSTR*);
++        static const auto pfn = reinterpret_cast<PFN_GetThreadDescription>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetThreadDescription"));
++        if (!pfn)
++            return name;
++        const HANDLE hThread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, dwTid);
++        if (!hThread)
++            return name;
++        PWSTR psz = nullptr;
++        if (SUCCEEDED(pfn(hThread, &psz)) && psz)
++        {
++            name = psz;
++            LocalFree(psz);
++        }
++        CloseHandle(hThread);
++        return name;
++    }
++
++    template <typename Map>
++    void LogTop(const wchar_t* pszTitle, const Map& counts, size_t nTotal, size_t nTop)
++    {
++        std::vector<std::pair<size_t, std::wstring>> sorted;
++        for (const auto& kv : counts)
++            sorted.emplace_back(kv.second, kv.first);
++        std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
++        GLog->Logf(L"LoadProfile: --- %s ---", pszTitle);
++        for (size_t i = 0; i < sorted.size() && i < nTop; ++i)
++        {
++            GLog->Logf(L"LoadProfile: %5.1f%% %6u  %s", 100.0 * sorted[i].first / std::max<size_t>(nTotal, 1),
++                static_cast<unsigned>(sorted[i].first), sorted[i].second.c_str());
++        }
++    }
++
++    void Report()
++    {
++        const ULONGLONG ullWallMs = GetTickCount64() - s_ullBeginTick;
++        const size_t nSamples = static_cast<size_t>(s_lSampleCount);
++
++        FILETIME ftC, ftE, ftK, ftU;
++        GetThreadTimes(GetCurrentThread(), &ftC, &ftE, &ftK, &ftU);
++        const double dMainKernelMs = (FileTimeToU64(ftK) - FileTimeToU64(s_ftMainKernel0)) / 10000.0;
++        const double dMainUserMs = (FileTimeToU64(ftU) - FileTimeToU64(s_ftMainUser0)) / 10000.0;
++
++        GLog->Logf(L"LoadProfile: load took %.1f s; main thread CPU user %.1f s, kernel %.1f s; %u samples (%u suspend failures, %u context failures).",
++            ullWallMs / 1000.0, dMainUserMs / 1000.0, dMainKernelMs / 1000.0,
++            static_cast<unsigned>(nSamples), static_cast<unsigned>(s_lSuspendFailures), static_cast<unsigned>(s_lContextFailures));
++
++        // CPU time per thread during the task
++        const auto times1 = SnapshotThreadTimes();
++        std::vector<std::pair<double, DWORD>> busy;
++        for (const auto& kv : times1)
++        {
++            const auto it0 = s_pThreadTimes0->find(kv.first);
++            const ULONGLONG k0 = it0 != s_pThreadTimes0->end() ? it0->second.first : 0;
++            const ULONGLONG u0 = it0 != s_pThreadTimes0->end() ? it0->second.second : 0;
++            busy.emplace_back(((kv.second.first - k0) + (kv.second.second - u0)) / 10000.0, kv.first);
++        }
++        std::sort(busy.begin(), busy.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
++        for (size_t i = 0; i < busy.size() && i < 8; ++i)
++        {
++            const DWORD tid = busy[i].second;
++            const auto& t1 = times1.at(tid);
++            const auto it0 = s_pThreadTimes0->find(tid);
++            const double dK = (t1.first - (it0 != s_pThreadTimes0->end() ? it0->second.first : 0)) / 10000.0;
++            const double dU = (t1.second - (it0 != s_pThreadTimes0->end() ? it0->second.second : 0)) / 10000.0;
++            GLog->Logf(L"LoadProfile: thread %u%s '%s': user %.1f s, kernel %.1f s", tid,
++                tid == s_dwMainThreadId ? L" (main)" : L"", ThreadName(tid).c_str(), dU / 1000.0, dK / 1000.0);
++        }
++
++        if (nSamples == 0)
++        {
++            return;
++        }
++
++        const std::vector<Symbols::ExportTable> tables = Symbols::BuildExportTables();
++        std::unordered_map<std::wstring, size_t> leaf, leafModule, firstGame, callers, chains;
++        for (size_t i = 0; i < nSamples; ++i)
++        {
++            const Sample& s = s_pSamples[i];
++            const std::wstring leafSym = Symbols::Symbolize(tables, s.Eip);
++            ++leaf[leafSym];
++            ++leafModule[Symbols::Symbolize(tables, s.Eip, true)];
++
++            // caller of the leaf (first plausible return address) and the
++            // first frame inside a game/launcher module
++            std::wstring firstGameSym = L"(none)";
++            for (BYTE f = 0; f < s.FrameCount; ++f)
++            {
++                if (!Symbols::IsSystemModule(Symbols::Symbolize(tables, s.Frames[f], true)))
++                {
++                    firstGameSym = Symbols::Symbolize(tables, s.Frames[f]);
++                    break;
++                }
++            }
++            ++firstGame[firstGameSym];
++            if (s.FrameCount > 0)
++            {
++                ++callers[leafSym + L"  <-  " + Symbols::Symbolize(tables, s.Frames[0])];
++            }
++            std::wstring chain = leafSym;
++            BYTE nGame = 0;
++            for (BYTE f = 0; f < s.FrameCount && nGame < 4; ++f)
++            {
++                const std::wstring mod = Symbols::Symbolize(tables, s.Frames[f], true);
++                if (Symbols::IsSystemModule(mod) && nGame == 0 && f > 3)
++                    continue;
++                chain += L"  <-  " + Symbols::Symbolize(tables, s.Frames[f]);
++                if (!Symbols::IsSystemModule(mod))
++                    ++nGame;
++            }
++            ++chains[chain];
++        }
++        LogTop(L"leaf module (where EIP was)", leafModule, nSamples, 12);
++        LogTop(L"leaf function", leaf, nSamples, 25);
++        LogTop(L"leaf <- caller", callers, nSamples, 25);
++        LogTop(L"first game/launcher frame on the stack", firstGame, nSamples, 25);
++        LogTop(L"stack chains (leaf <- ... up to 4 game frames)", chains, nSamples, 15);
++    }
++}
++
++void LoadProfiler::ReadConfig()
++{
++    UBOOL bEnabled = FALSE; //Diagnostics only: SuspendThread sampling costs time under Wine
++    GConfig->GetBool(PROJECTNAME, L"LoadProfiler", bEnabled);
++    s_bEnabled = bEnabled != FALSE;
++    GLog->Logf(L"Load profiler: %s.", s_bEnabled ? L"on" : L"off");
++}
++
++void LoadProfiler::OnLoadBegin()
++{
++    if (!s_bEnabled || s_lSampling)
++    {
++        return;
++    }
++    if (!s_hSampler)
++    {
++        if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &s_hMainThread,
++            THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, 0))
++        {
++            s_bEnabled = false;
++            return;
++        }
++        s_dwMainThreadId = GetCurrentThreadId();
++        const NT_TIB* const pTib = reinterpret_cast<const NT_TIB*>(NtCurrentTeb());
++        s_dwStackBase = reinterpret_cast<DWORD>(pTib->StackBase);
++        s_dwStackLimit = reinterpret_cast<DWORD>(pTib->StackLimit);
++        // The reserved stack may be larger than the committed StackLimit; the
++        // copy is guarded by SEH anyway, so allow the whole reservation.
++        MEMORY_BASIC_INFORMATION mbi = {};
++        if (VirtualQuery(reinterpret_cast<LPCVOID>(s_dwStackBase - 1), &mbi, sizeof(mbi)))
++        {
++            s_dwStackLimit = reinterpret_cast<DWORD>(mbi.AllocationBase);
++        }
++        s_pSamples = static_cast<Sample*>(VirtualAlloc(nullptr, sizeof(Sample) * MaxSamples, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
++        s_pStackCopy = static_cast<BYTE*>(VirtualAlloc(nullptr, StackCopyBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
++        s_hWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
++        if (!s_pSamples || !s_pStackCopy || !s_hWake)
++        {
++            s_bEnabled = false;
++            return;
++        }
++        s_hSampler = CreateThread(nullptr, 64 * 1024, SamplerProc, nullptr, 0, nullptr);
++        if (!s_hSampler)
++        {
++            s_bEnabled = false;
++            return;
++        }
++        SetThreadPriority(s_hSampler, THREAD_PRIORITY_ABOVE_NORMAL);
++    }
++
++    // Wait until a previous sampling run has fully stopped.
++    while (!s_lSamplerIdle)
++    {
++        Sleep(1);
++    }
++    SnapshotModules();
++    if (!s_pThreadTimes0)
++    {
++        s_pThreadTimes0 = new ThreadTimes();
++    }
++    *s_pThreadTimes0 = SnapshotThreadTimes();
++    FILETIME ftC, ftE;
++    GetThreadTimes(GetCurrentThread(), &ftC, &ftE, &s_ftMainKernel0, &s_ftMainUser0);
++    s_lSampleCount = 0;
++    s_lSuspendFailures = 0;
++    s_lContextFailures = 0;
++    s_ullBeginTick = GetTickCount64();
++    InterlockedExchange(&s_lSampling, 1);
++    SetEvent(s_hWake);
++}
++
++void LoadProfiler::OnLoadEnd()
++{
++    if (!s_bEnabled || !s_lSampling)
++    {
++        return;
++    }
++    InterlockedExchange(&s_lSampling, 0);
++    while (!s_lSamplerIdle)
++    {
++        Sleep(1);
++    }
++    Report();
++}
++
++void LoadProfiler::Shutdown()
++{
++    s_bEnabled = false;
++    InterlockedExchange(&s_lSampling, 0);
++}
+diff --git a/launcher/src/LoadProfiler.h b/launcher/src/LoadProfiler.h
+new file mode 100644
+index 0000000..a4b4502
+--- /dev/null
++++ b/launcher/src/LoadProfiler.h
+@@ -0,0 +1,26 @@
++#pragma once
++
++// Sampling profiler for level / savegame loads.
++//
++// Level loads on the Android tablet (Wine + FEX) take minutes while the main
++// thread is mostly sleeping. Without root there is no perf/strace there, so
++// this measures from inside the process: while a map loads, a helper
++// thread periodically suspends the main thread, records EIP and the return
++// addresses found on its stack, and resumes it. When the new level is up the
++// samples are symbolized via the modules' export tables and a summary goes to
++// the log ("LoadProfile: ..."), plus per-thread CPU time during the load.
++//
++// Off by default; [DeusExe] LoadProfiler=True enables it.
++namespace LoadProfiler
++{
++    void ReadConfig();
++
++    // Called on the main thread: when the engine logs "LoadMap: ..." and when
++    // CLevelWatch sees the new level.
++    void OnLoadBegin();
++    void OnLoadEnd();
++
++    // Stops sampling without a report (crash paths); doesn't wait for the
++    // sampler thread.
++    void Shutdown();
++}
+diff --git a/launcher/src/OutputDeviceFileFlush.h b/launcher/src/OutputDeviceFileFlush.h
+index 7c9e141..d55c7fb 100644
+--- a/launcher/src/OutputDeviceFileFlush.h
++++ b/launcher/src/OutputDeviceFileFlush.h
+@@ -1,6 +1,10 @@
+ #pragma once
+ 
+ #include "LogTime.h"
++#include "FileHooks.h"
++#include "LevelWatch.h"
++#include "LoadProfiler.h"
++#include "PathCache.h"
+ 
+ namespace
+ {
+@@ -39,6 +43,17 @@ class FOutputDeviceFileFlush : public FOutputDeviceFile
+ public:
+     void Serialize(const TCHAR* Data, enum EName Event)
+     {
++        //A map load starts: list directories afresh (a cheap guard against
++        //changes the file hooks didn't see), patch modules loaded since, and
++        //profile the load until CLevelWatch reports it done.
++        if (Event == NAME_Log && Data && wcsncmp(Data, L"LoadMap: ", 9) == 0)
++        {
++            PathCache::InvalidateAll();
++            FileHooks::Rescan();
++            LoadProfiler::OnLoadBegin();
++            CLevelWatch::NoteLoadMap();
++        }
++
+         //FOutputDeviceFile skips file output for NAME_Title but still
+         //forwards Data to GLogHook, which WLog uses as its window caption -
+         //a timestamp there would be wrong.
+diff --git a/launcher/src/PathCache.cpp b/launcher/src/PathCache.cpp
+new file mode 100644
+index 0000000..6df7ee2
+--- /dev/null
++++ b/launcher/src/PathCache.cpp
+@@ -0,0 +1,448 @@
++#include "stdafx.h"
++#include "PathCache.h"
++#include "Misc.h"
++
++#include <new>
++
++#ifndef FIND_FIRST_EX_LARGE_FETCH
++#define FIND_FIRST_EX_LARGE_FETCH 0x00000002
++#endif
++
++namespace
++{
++    HANDLE s_hHeap = nullptr;
++
++    //Allocator on the private heap: lookups come from any thread, and global
++    //operator new is the engine's GMalloc, which isn't thread-safe.
++    template <class T>
++    struct THeapAllocator
++    {
++        using value_type = T;
++
++        THeapAllocator() = default;
++        template <class U> THeapAllocator(const THeapAllocator<U>&) noexcept {}
++
++        T* allocate(const size_t n)
++        {
++            void* const p = HeapAlloc(s_hHeap, 0, n * sizeof(T));
++            if (!p)
++            {
++                throw std::bad_alloc();
++            }
++            return static_cast<T*>(p);
++        }
++
++        void deallocate(T* const p, size_t) noexcept
++        {
++            HeapFree(s_hHeap, 0, p);
++        }
++
++        template <class U> bool operator==(const THeapAllocator<U>&) const noexcept { return true; }
++        template <class U> bool operator!=(const THeapAllocator<U>&) const noexcept { return false; }
++    };
++
++    using FKey = std::basic_string<wchar_t, std::char_traits<wchar_t>, THeapAllocator<wchar_t>>;
++
++    struct FKeyHash
++    {
++        size_t operator()(const FKey& Key) const noexcept
++        {
++            size_t h = 2166136261u; //FNV-1a
++            for (const wchar_t c : Key)
++            {
++                h = (h ^ c) * 16777619u;
++            }
++            return h;
++        }
++    };
++
++    template <class V>
++    using TKeyMap = std::unordered_map<FKey, V, FKeyHash, std::equal_to<FKey>, THeapAllocator<std::pair<const FKey, V>>>;
++
++    struct FEntry
++    {
++        FKey Name;          //As on disk
++        INT iSize;          //-1 for directories
++        bool bDirectory;
++    };
++
++    struct FListing
++    {
++        bool bMissing = false;      //The directory doesn't exist
++        TKeyMap<FEntry> Entries;    //Upper-cased name -> entry
++    };
++
++    struct FState
++    {
++        TKeyMap<FListing> Listings;                         //Upper-cased full directory path with trailing backslash -> listing
++        FKey Root;                                          //Upper-cased game directory with trailing backslash
++        std::vector<FKey, THeapAllocator<FKey>> Excluded;   //Same form; never cached
++    };
++
++    volatile bool s_bEnabled = false;
++    SRWLOCK s_Lock = SRWLOCK_INIT;
++    FState* s_pState = nullptr; //Never freed: hooks on other threads may still be looking
++
++    //Set while this thread holds s_Lock. A hooked file call made from inside
++    //(the directory listing itself) must not come back in: SRW locks aren't
++    //recursive.
++    thread_local bool t_bBusy = false;
++
++    //Counters since the previous ReportStats; guarded by s_Lock
++    LONG s_lLookups = 0;
++    LONG s_lAnswered = 0;
++    LONG s_lMissing = 0;
++    LONG s_lListings = 0;
++    LONG s_lInvalidations = 0;
++    LONGLONG s_llListingTicks = 0;
++
++    class FScopedLock
++    {
++    public:
++        FScopedLock()
++        {
++            AcquireSRWLockExclusive(&s_Lock);
++            t_bBusy = true;
++        }
++
++        ~FScopedLock()
++        {
++            t_bBusy = false;
++            ReleaseSRWLockExclusive(&s_Lock);
++        }
++
++        FScopedLock(const FScopedLock&) = delete;
++        FScopedLock& operator=(const FScopedLock&) = delete;
++    };
++
++    FKey MakeKey(const wchar_t* const p, const size_t n)
++    {
++        FKey Key(p, n);
++        if (n)
++        {
++            CharUpperBuffW(&Key[0], static_cast<DWORD>(n));
++        }
++        return Key;
++    }
++
++    bool StartsWith(const FKey& s, const FKey& Prefix)
++    {
++        return s.size() >= Prefix.size() && s.compare(0, Prefix.size(), Prefix) == 0;
++    }
++
++    //Upper-cased full path of pszBase\pszRelative with a trailing backslash; empty on failure.
++    FKey FullDirKey(const wchar_t* const pszBase, const wchar_t* const pszRelative)
++    {
++        wchar_t szCombined[MAX_PATH];
++        wchar_t szFull[MAX_PATH];
++        if (!PathCombine(szCombined, pszBase, pszRelative))
++        {
++            return FKey();
++        }
++        const DWORD dwLen = GetFullPathNameW(szCombined, MAX_PATH - 1, szFull, nullptr);
++        if (dwLen == 0 || dwLen >= MAX_PATH - 1)
++        {
++            return FKey();
++        }
++        FKey Key = MakeKey(szFull, dwLen);
++        if (Key.back() != L'\\')
++        {
++            Key += L'\\';
++        }
++        return Key;
++    }
++
++    //Full path of pszPath and where its last component starts. False for
++    //what the cache leaves to the OS: wildcards, devices and UNC paths, 8.3
++    //aliases ('~'), stream names, over-long paths, paths ending in '\'.
++    bool Resolve(const wchar_t* const pszPath, wchar_t(&szFull)[MAX_PATH], size_t& iNameAt)
++    {
++        if (!pszPath || !*pszPath || wcspbrk(pszPath, L"*?<>|\"~") != nullptr)
++        {
++            return false;
++        }
++        wchar_t* pszName = nullptr;
++        const DWORD dwLen = GetFullPathNameW(pszPath, MAX_PATH, szFull, &pszName);
++        if (dwLen == 0 || dwLen >= MAX_PATH || !pszName || !*pszName)
++        {
++            return false;
++        }
++        if (szFull[1] != L':' || szFull[2] != L'\\' || wcschr(szFull + 2, L':') != nullptr)
++        {
++            return false;
++        }
++        iNameAt = static_cast<size_t>(pszName - szFull);
++        return true;
++    }
++
++    bool IsCached(const FKey& DirKey)
++    {
++        if (!StartsWith(DirKey, s_pState->Root))
++        {
++            return false;
++        }
++        for (const FKey& Excluded : s_pState->Excluded)
++        {
++            if (StartsWith(DirKey, Excluded))
++            {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    //The listing of pszDir (full path, iDirLen chars including the trailing
++    //backslash), made now if there is none yet. Null if the directory can't
++    //be listed. Needs s_Lock.
++    const FListing* GetListing(const wchar_t* const pszDir, const size_t iDirLen, const FKey& DirKey)
++    {
++        const auto It = s_pState->Listings.find(DirKey);
++        if (It != s_pState->Listings.end())
++        {
++            return &It->second;
++        }
++
++        wchar_t szSpec[MAX_PATH + 2];
++        wmemcpy(szSpec, pszDir, iDirLen);
++        szSpec[iDirLen] = L'*';
++        szSpec[iDirLen + 1] = L'\0';
++
++        LARGE_INTEGER liStart, liEnd;
++        QueryPerformanceCounter(&liStart);
++        FListing Listing;
++        WIN32_FIND_DATAW Data;
++        const HANDLE hFind = FindFirstFileExW(szSpec, FindExInfoBasic, &Data, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
++        if (hFind == INVALID_HANDLE_VALUE)
++        {
++            const DWORD dwError = GetLastError();
++            if (dwError == ERROR_PATH_NOT_FOUND || dwError == ERROR_DIRECTORY || dwError == ERROR_INVALID_NAME)
++            {
++                Listing.bMissing = true;
++            }
++            else if (dwError != ERROR_FILE_NOT_FOUND) //"Not found" is an existing but empty directory
++            {
++                return nullptr; //E.g. access denied: leave it to the OS
++            }
++        }
++        else
++        {
++            do
++            {
++                if (wcscmp(Data.cFileName, L".") == 0 || wcscmp(Data.cFileName, L"..") == 0)
++                {
++                    continue;
++                }
++                const size_t iLen = wcslen(Data.cFileName);
++                const bool bDirectory = (Data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
++                Listing.Entries.emplace(MakeKey(Data.cFileName, iLen), FEntry{ FKey(Data.cFileName, iLen), bDirectory ? -1 : static_cast<INT>(Data.nFileSizeLow), bDirectory });
++            } while (FindNextFileW(hFind, &Data));
++            const bool bComplete = GetLastError() == ERROR_NO_MORE_FILES;
++            FindClose(hFind);
++            if (!bComplete)
++            {
++                return nullptr; //A partial listing would report the rest as missing
++            }
++        }
++        QueryPerformanceCounter(&liEnd);
++        s_llListingTicks += liEnd.QuadPart - liStart.QuadPart;
++        ++s_lListings;
++        return &s_pState->Listings.emplace(DirKey, std::move(Listing)).first->second;
++    }
++}
++
++void PathCache::ReadConfig()
++{
++    assert(GConfig);
++    assert(GSys);
++    UBOOL bEnabled = TRUE;
++    GConfig->GetBool(PROJECTNAME, L"PathCache", bEnabled);
++    if (!bEnabled)
++    {
++        s_bEnabled = false;
++        GLog->Log(L"Path cache: off.");
++        return;
++    }
++
++    if (!s_pState)
++    {
++        s_hHeap = HeapCreate(0, 0, 0);
++        void* const pMem = s_hHeap ? HeapAlloc(s_hHeap, 0, sizeof(FState)) : nullptr;
++        if (!pMem)
++        {
++            GLog->Log(L"Path cache: off (no heap).");
++            return;
++        }
++        s_pState = new(pMem) FState();
++    }
++
++    wchar_t szSystem[MAX_PATH];
++    Misc::GetGameSystemDir(szSystem);
++    {
++        FScopedLock Lock;
++        s_pState->Listings.clear();
++        s_pState->Excluded.clear();
++        s_pState->Root = FullDirKey(szSystem, L"..");
++        for (const FString* const pPath : { &GSys->SavePath, &GSys->CachePath })
++        {
++            if (pPath->Len() > 0)
++            {
++                FKey Key = FullDirKey(szSystem, **pPath);
++                if (!Key.empty())
++                {
++                    s_pState->Excluded.push_back(std::move(Key));
++                }
++            }
++        }
++    }
++    s_bEnabled = !s_pState->Root.empty();
++    GLog->Logf(L"Path cache: %s for '%s' (not cached: '%s', '%s').", s_bEnabled ? L"on" : L"off",
++        s_pState->Root.c_str(),
++        s_pState->Excluded.size() > 0 ? s_pState->Excluded[0].c_str() : L"",
++        s_pState->Excluded.size() > 1 ? s_pState->Excluded[1].c_str() : L"");
++}
++
++bool PathCache::Enabled()
++{
++    return s_bEnabled;
++}
++
++void PathCache::Disable()
++{
++    s_bEnabled = false;
++}
++
++PathCache::FInfo PathCache::Lookup(const wchar_t* const pszPath, wchar_t* const pszActual)
++{
++    FInfo Info;
++    if (!s_bEnabled || t_bBusy)
++    {
++        return Info;
++    }
++    wchar_t szFull[MAX_PATH];
++    size_t iNameAt;
++    if (!Resolve(pszPath, szFull, iNameAt))
++    {
++        return Info;
++    }
++    const FKey DirKey = MakeKey(szFull, iNameAt);
++    if (!StartsWith(DirKey, s_pState->Root)) //Root only changes in ReadConfig
++    {
++        return Info;
++    }
++    const FKey NameKey = MakeKey(szFull + iNameAt, wcslen(szFull + iNameAt));
++
++    FScopedLock Lock;
++    ++s_lLookups;
++    if (!IsCached(DirKey))
++    {
++        return Info;
++    }
++    const FListing* const pListing = GetListing(szFull, iNameAt, DirKey);
++    if (!pListing)
++    {
++        return Info;
++    }
++    ++s_lAnswered;
++    if (pListing->bMissing)
++    {
++        ++s_lMissing;
++        Info.Kind = EKind::NoPath;
++        return Info;
++    }
++    const auto It = pListing->Entries.find(NameKey);
++    if (It == pListing->Entries.cend())
++    {
++        ++s_lMissing;
++        Info.Kind = EKind::NoFile;
++        return Info;
++    }
++    Info.Kind = It->second.bDirectory ? EKind::Directory : EKind::File;
++    Info.iSize = It->second.iSize;
++    if (pszActual)
++    {
++        wmemcpy(pszActual, szFull, iNameAt);
++        wcsncpy_s(pszActual + iNameAt, MAX_PATH - iNameAt, It->second.Name.c_str(), _TRUNCATE);
++    }
++    return Info;
++}
++
++void PathCache::Invalidate(const wchar_t* const pszPath)
++{
++    if (!s_bEnabled || t_bBusy)
++    {
++        return;
++    }
++    wchar_t szFull[MAX_PATH];
++    const DWORD dwLen = (pszPath && *pszPath) ? GetFullPathNameW(pszPath, MAX_PATH, szFull, nullptr) : 0;
++    if (dwLen == 0 || dwLen >= MAX_PATH)
++    {
++        InvalidateAll(); //Can't tell what changed
++        return;
++    }
++
++    //Treat the path as an entry of its parent, also when given as "dir\"
++    size_t iLen = dwLen;
++    while (iLen > 3 && szFull[iLen - 1] == L'\\')
++    {
++        szFull[--iLen] = L'\0';
++    }
++    const wchar_t* const pszLast = wcsrchr(szFull, L'\\');
++    if (!pszLast)
++    {
++        InvalidateAll();
++        return;
++    }
++    const FKey DirKey = MakeKey(szFull, static_cast<size_t>(pszLast - szFull) + 1);
++    if (!StartsWith(DirKey, s_pState->Root))
++    {
++        return; //Nothing outside the game directory is cached
++    }
++    FKey SelfKey = MakeKey(szFull, iLen);
++    SelfKey += L'\\';
++
++    FScopedLock Lock;
++    ++s_lInvalidations;
++    s_pState->Listings.erase(DirKey);
++    for (auto It = s_pState->Listings.begin(); It != s_pState->Listings.end();)
++    {
++        It = StartsWith(It->first, SelfKey) ? s_pState->Listings.erase(It) : std::next(It);
++    }
++}
++
++void PathCache::InvalidateAll()
++{
++    if (!s_bEnabled || t_bBusy)
++    {
++        return;
++    }
++    FScopedLock Lock;
++    ++s_lInvalidations;
++    s_pState->Listings.clear();
++}
++
++void PathCache::ReportStats()
++{
++    if (!s_pState)
++    {
++        return;
++    }
++    LONG lLookups, lAnswered, lMissing, lListings, lInvalidations;
++    LONGLONG llListingTicks;
++    size_t nDirs;
++    {
++        FScopedLock Lock;
++        lLookups = s_lLookups;
++        lAnswered = s_lAnswered;
++        lMissing = s_lMissing;
++        lListings = s_lListings;
++        lInvalidations = s_lInvalidations;
++        llListingTicks = s_llListingTicks;
++        nDirs = s_pState->Listings.size();
++        s_lLookups = s_lAnswered = s_lMissing = s_lListings = s_lInvalidations = 0;
++        s_llListingTicks = 0;
++    }
++    LARGE_INTEGER liFreq;
++    QueryPerformanceFrequency(&liFreq);
++    GLog->Logf(L"Path cache: %i lookups, %i answered (%i not found); %i directory listings (%.0f ms), %i invalidations; %i directories cached.",
++        lLookups, lAnswered, lMissing, lListings, llListingTicks * 1000.0 / liFreq.QuadPart, lInvalidations, static_cast<INT>(nDirs));
++}
+diff --git a/launcher/src/PathCache.h b/launcher/src/PathCache.h
+new file mode 100644
+index 0000000..e94d63c
+--- /dev/null
++++ b/launcher/src/PathCache.h
+@@ -0,0 +1,56 @@
++#pragma once
++
++// Directory listings of the game directory, for answering "does this file
++// exist, and how big is it" without asking the OS each time.
++//
++// Under Wine on Android's case-sensitive FUSE storage every lookup of a file
++// that doesn't exist makes Wine scan the whole directory for a
++// case-insensitive match - milliseconds each - and the game makes thousands
++// of them per map load: the engine probes every search path for each package
++// and localization file (appFindPackageFile, FConfigCacheIni::Find via
++// GFileManager->FileSize), and D3D10Drv looks for replacement .dds/.flags
++// files for every texture it uploads. Level and savegame loads on the tablet
++// spent minutes in failed CreateFileW calls.
++//
++// Each directory below the game directory is listed once and lookups are
++// answered from the listing. The save and cache directories are never
++// cached. Whatever creates, writes, moves or deletes files must call
++// Invalidate - FileHooks does for the whole process - and every map load
++// starts afresh (InvalidateAll).
++//
++// Thread-safe; keeps its data on a private heap, as the engine's allocator
++// isn't thread-safe. [DeusExe] PathCache=False disables it.
++namespace PathCache
++{
++    enum class EKind
++    {
++        Unknown,    // not answered: disabled, outside the game directory, excluded, odd name
++        NoFile,     // the directory exists, the file doesn't
++        NoPath,     // the directory doesn't exist
++        File,
++        Directory,
++    };
++
++    struct FInfo
++    {
++        EKind Kind = EKind::Unknown;
++        INT iSize = -1;     // files only
++    };
++
++    // Needs GConfig and GSys: call on the main thread when the game starts.
++    void ReadConfig();
++    bool Enabled();
++    void Disable();
++
++    // pszActual (optional, MAX_PATH chars) receives the full path with the
++    // last component spelled as on disk (File and Directory only).
++    FInfo Lookup(const wchar_t* pszPath, wchar_t* pszActual = nullptr);
++
++    // Forget the directory holding pszPath, and pszPath itself (with its
++    // subdirectories) in case it is or was a directory.
++    void Invalidate(const wchar_t* pszPath);
++    void InvalidateAll();
++
++    // Logs the counters gathered since the previous call. Main thread.
++    void ReportStats();
++}
+diff --git a/launcher/src/Symbols.cpp b/launcher/src/Symbols.cpp
+new file mode 100644
+index 0000000..76d6984
+--- /dev/null
++++ b/launcher/src/Symbols.cpp
+@@ -0,0 +1,120 @@
++#include "stdafx.h"
++#include "Symbols.h"
++
++#include <psapi.h>
++#pragma comment(lib, "psapi.lib")
++
++namespace
++{
++    std::wstring Narrow2Wide(const std::string& s)
++    {
++        return std::wstring(s.begin(), s.end());
++    }
++}
++
++std::vector<Symbols::ExportTable> Symbols::BuildExportTables()
++{
++    std::vector<ExportTable> tables;
++    HMODULE hMods[512];
++    DWORD cbNeeded = 0;
++    if (!EnumProcessModules(GetCurrentProcess(), hMods, sizeof(hMods), &cbNeeded))
++        return tables;
++    const int iCount = std::min<int>(cbNeeded / sizeof(HMODULE), _countof(hMods));
++    for (int i = 0; i < iCount; ++i)
++    {
++        ExportTable t;
++        MODULEINFO mi = {};
++        if (!GetModuleInformation(GetCurrentProcess(), hMods[i], &mi, sizeof(mi)))
++            continue;
++        wchar_t szName[MAX_PATH] = L"?";
++        GetModuleBaseNameW(GetCurrentProcess(), hMods[i], szName, MAX_PATH);
++        t.Module = szName;
++        t.Base = reinterpret_cast<DWORD>(mi.lpBaseOfDll);
++        t.End = t.Base + mi.SizeOfImage;
++        const BYTE* const pBase = reinterpret_cast<const BYTE*>(mi.lpBaseOfDll);
++        const auto* const pDos = reinterpret_cast<const IMAGE_DOS_HEADER*>(pBase);
++        if (pDos->e_magic == IMAGE_DOS_SIGNATURE)
++        {
++            const auto* const pNt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(pBase + pDos->e_lfanew);
++            const IMAGE_DATA_DIRECTORY& dir = pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
++            if (pNt->Signature == IMAGE_NT_SIGNATURE && dir.VirtualAddress && dir.Size)
++            {
++                const auto* const pExp = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(pBase + dir.VirtualAddress);
++                const DWORD* const pFuncs = reinterpret_cast<const DWORD*>(pBase + pExp->AddressOfFunctions);
++                const DWORD* const pNames = reinterpret_cast<const DWORD*>(pBase + pExp->AddressOfNames);
++                const WORD* const pOrds = reinterpret_cast<const WORD*>(pBase + pExp->AddressOfNameOrdinals);
++                std::vector<bool> named(pExp->NumberOfFunctions, false);
++                for (DWORD n = 0; n < pExp->NumberOfNames; ++n)
++                {
++                    const WORD ord = pOrds[n];
++                    if (ord >= pExp->NumberOfFunctions)
++                        continue;
++                    const DWORD rva = pFuncs[ord];
++                    if (rva >= dir.VirtualAddress && rva < dir.VirtualAddress + dir.Size)
++                        continue;   // forwarder
++                    t.Exports.emplace_back(rva, reinterpret_cast<const char*>(pBase + pNames[n]));
++                    named[ord] = true;
++                }
++                for (DWORD o = 0; o < pExp->NumberOfFunctions; ++o)
++                {
++                    const DWORD rva = pFuncs[o];
++                    if (named[o] || !rva || (rva >= dir.VirtualAddress && rva < dir.VirtualAddress + dir.Size))
++                        continue;
++                    t.Exports.emplace_back(rva, "#" + std::to_string(o + pExp->Base));
++                }
++                std::sort(t.Exports.begin(), t.Exports.end());
++            }
++        }
++        tables.push_back(std::move(t));
++    }
++    return tables;
++}
++
++// "Module+0x1a2b (Export+0x1a)" (export name shortened for C++ decorated names)
++std::wstring Symbols::Symbolize(const std::vector<ExportTable>& tables, DWORD dwAddr, bool bModuleOnly)
++{
++    for (const ExportTable& t : tables)
++    {
++        if (dwAddr < t.Base || dwAddr >= t.End)
++            continue;
++        if (bModuleOnly)
++            return t.Module;
++        const DWORD rva = dwAddr - t.Base;
++        auto it = std::upper_bound(t.Exports.begin(), t.Exports.end(), std::make_pair(rva, std::string("\xff")));
++        wchar_t sz[512];
++        if (it == t.Exports.begin())
++        {
++            swprintf_s(sz, L"%s+0x%x", t.Module.c_str(), rva);
++            return sz;
++        }
++        --it;
++        std::string name = it->second;
++        if (name.size() > 60)
++            name = name.substr(0, 60) + "...";
++        swprintf_s(sz, L"%s+0x%x (%s+0x%x)", t.Module.c_str(), rva, Narrow2Wide(name).c_str(), rva - it->first);
++        return sz;
++    }
++    wchar_t sz[32];
++    swprintf_s(sz, L"0x%08x", dwAddr);
++    return sz;
++}
++
++bool Symbols::IsSystemModule(const std::wstring& module)
++{
++    static const wchar_t* const s_aSystem[] = {
++        L"ntdll.dll", L"kernel32.dll", L"kernelbase.dll", L"user32.dll", L"win32u.dll", L"gdi32.dll",
++        L"msvcrt.dll", L"ucrtbase.dll", L"msvcp140.dll", L"vcruntime140.dll", L"msvcr100.dll", L"msvcp100.dll",
++        L"msvcr71.dll", L"msvcr80.dll", L"msvcr90.dll", L"winmm.dll", L"dsound.dll",
++        L"advapi32.dll", L"sechost.dll", L"rpcrt4.dll", L"combase.dll", L"ole32.dll", L"imm32.dll",
++        L"shell32.dll", L"shlwapi.dll", L"comctl32.dll", L"uxtheme.dll", L"dxgi.dll", L"d3d10.dll",
++        L"d3d10_1.dll", L"d3d11.dll", L"d3d10core.dll", L"d3dx10_43.dll", L"d3dcompiler_43.dll", L"d3dcompiler_47.dll",
++        L"winevulkan.dll", L"vulkan-1.dll", L"dinput.dll",
++        L"dinput8.dll", L"xinput1_3.dll", L"hid.dll", L"setupapi.dll", L"psapi.dll", L"version.dll",
++    };
++    for (const wchar_t* p : s_aSystem)
++    {
++        if (_wcsicmp(module.c_str(), p) == 0)
++            return true;
++    }
++    return false;
++}
+diff --git a/launcher/src/Symbols.h b/launcher/src/Symbols.h
+new file mode 100644
+index 0000000..480cb7f
+--- /dev/null
++++ b/launcher/src/Symbols.h
+@@ -0,0 +1,26 @@
++#pragma once
++
++// Address -> "Module+0xRVA (NearestExport+0xOffset)" from the loaded
++// modules' export tables. The diagnostics (LoadProfiler, FileHooks) have no
++// debug symbols for the game's DLLs, and the nearest export plus the RVA is
++// enough to find a function in a disassembly.
++namespace Symbols
++{
++    struct ExportTable
++    {
++        std::wstring Module;
++        DWORD Base = 0;
++        DWORD End = 0;
++        std::vector<std::pair<DWORD, std::string>> Exports;   // sorted by RVA
++    };
++
++    // Snapshot of the modules loaded now. Allocates through the engine's
++    // allocator: main thread only.
++    std::vector<ExportTable> BuildExportTables();
++
++    std::wstring Symbolize(const std::vector<ExportTable>& Tables, DWORD dwAddr, bool bModuleOnly = false);
++
++    // OS, C runtime and graphics-stack modules: skipped when looking for the
++    // game frame responsible for a call.
++    bool IsSystemModule(const std::wstring& Module);
++}
+diff --git a/launcher/src/launcher.vcxproj b/launcher/src/launcher.vcxproj
+index d9f04a6..bc40270 100644
+--- a/launcher/src/launcher.vcxproj
++++ b/launcher/src/launcher.vcxproj
+@@ -92,6 +92,11 @@
+       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">Use</PrecompiledHeader>
+     </ClCompile>
+     <ClCompile Include="FileManagerDeusExe.cpp" />
++    <ClCompile Include="FastFileReader.cpp" />
++    <ClCompile Include="LoadProfiler.cpp" />
++    <ClCompile Include="PathCache.cpp" />
++    <ClCompile Include="FileHooks.cpp" />
++    <ClCompile Include="Symbols.cpp" />
+     <ClCompile Include="ExecHook.cpp" />
+     <ClCompile Include="FrameStats.cpp" />
+     <ClCompile Include="FramePacing.cpp" />
+@@ -164,6 +169,11 @@
+     <ClInclude Include="DialogPadNav.h" />
+     <ClInclude Include="ExecHook.h" />
+     <ClInclude Include="FileManagerDeusExe.h" />
++    <ClInclude Include="FastFileReader.h" />
++    <ClInclude Include="LoadProfiler.h" />
++    <ClInclude Include="PathCache.h" />
++    <ClInclude Include="FileHooks.h" />
++    <ClInclude Include="Symbols.h" />
+     <ClInclude Include="FrameStats.h" />
+     <ClInclude Include="FramePacing.h" />
+     <ClInclude Include="CursorPolicy.h" />
+-- 
+2.54.0.windows.1
+
